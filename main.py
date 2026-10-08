@@ -75,7 +75,7 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
-        trade_session=TradeSessions.Intraday,
+        trade_sessions=TradeSessions.Intraday,
     )
 
 
