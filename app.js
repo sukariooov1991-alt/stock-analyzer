@@ -1,9 +1,10 @@
 /* ============================================================
-   app.js — النسخة النهائية
+   app.js — النسخة النهائية مع إعادة اتصال WebSocket
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
+const reconnectTimers = new Map();
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -22,6 +23,7 @@ const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
 
+/* الثيم */
 function applyTheme(light) {
   document.body.classList.toggle("light", light);
   themeIcon.textContent = light ? "☀️" : "🌙";
@@ -30,6 +32,7 @@ function applyTheme(light) {
 themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
 applyTheme(localStorage.getItem("theme") === "light");
 
+/* حالة السوق */
 function updateMarketStatus() {
   const now = new Date();
   const nyH = (now.getUTCHours() - 4 + 24) % 24;
@@ -45,6 +48,7 @@ function updateMarketStatus() {
 updateMarketStatus();
 setInterval(updateMarketStatus, 60000);
 
+/* الاتصال */
 function setConnection(online) {
   connectionStatus.className = "status " + (online ? "online" : "offline");
   connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
@@ -245,15 +249,45 @@ function deleteCard(symbol) {
     try { socketMap.get(symbol).close(); } catch (e) {}
     socketMap.delete(symbol);
   }
+  if (reconnectTimers.has(symbol)) {
+    clearTimeout(reconnectTimers.get(symbol));
+    reconnectTimers.delete(symbol);
+  }
 }
 
+/* ✅ WebSocket مع إعادة اتصال تلقائي و ping */
 function connectLive(symbol) {
-  if (socketMap.has(symbol)) return;
+  if (socketMap.has(symbol)) {
+    try { socketMap.get(symbol).close(); } catch (e) {}
+  }
+
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${window.location.host}/ws/${symbol}`);
-  ws.onopen = () => setConnection(true);
-  ws.onclose = () => setConnection(false);
+
+  ws.onopen = () => {
+    setConnection(true);
+    // ✅ ping كل 30 ثانية لإبقاء الاتصال حياً ومنع Render من النوم
+    ws._ping = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send("ping"); } catch (e) {}
+      }
+    }, 30000);
+  };
+
+  ws.onclose = () => {
+    setConnection(false);
+    if (ws._ping) clearInterval(ws._ping);
+    socketMap.delete(symbol);
+
+    // ✅ إعادة الاتصال بعد 5 ثوان
+    if (cards.find(c => c.symbol === symbol)) {
+      const timer = setTimeout(() => connectLive(symbol), 5000);
+      reconnectTimers.set(symbol, timer);
+    }
+  };
+
   ws.onerror = () => setConnection(false);
+
   ws.onmessage = (ev) => {
     try {
       const m = JSON.parse(ev.data);
@@ -264,6 +298,7 @@ function connectLive(symbol) {
       if (el) el.textContent = "$" + m.price.toFixed(2);
     } catch (e) {}
   };
+
   socketMap.set(symbol, ws);
 }
 
