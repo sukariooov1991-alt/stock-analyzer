@@ -60,7 +60,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== OI Block — بنية ثابتة 5 صفوف ===== */
+/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -158,12 +158,18 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ===== الشرائط الكبيرة ===== */
+/* ============================================================
+   ✅ الشرائط — تُحسب من المصفوفة نفسها
+   ============================================================ */
 function updatePutCallBars(root, sym, card) {
-  const totalCallOI  = card.total_call_oi  || 0;
-  const totalPutOI   = card.total_put_oi   || 0;
-  const totalCallVol = card.total_call_vol || 0;
-  const totalPutVol  = card.total_put_vol  || 0;
+  const callOI = card.call_oi || [];
+  const putOI  = card.put_oi  || [];
+
+  // ✅ احسب من المصفوفات — نفس البيانات التي تُستخدم في البطاقات
+  const totalCallOI  = callOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const totalPutOI   = putOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const totalCallVol = callOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const totalPutVol  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
 
   const totalOI = totalCallOI + totalPutOI;
   let putOIPct = 50, callOIPct = 50;
@@ -179,14 +185,14 @@ function updatePutCallBars(root, sym, card) {
     callVolPct = 100 - putVolPct;
   }
 
-  const putOISpan = root.querySelector(`#put-oi-pct-${sym}`);
+  const putOISpan  = root.querySelector(`#put-oi-pct-${sym}`);
   const callOISpan = root.querySelector(`#call-oi-pct-${sym}`);
   const callOIFill = root.querySelector(`#call-oi-fill-${sym}`);
   if (putOISpan)  putOISpan.textContent  = `PUT ${putOIPct}%`;
   if (callOISpan) callOISpan.textContent = `${callOIPct}% CALL`;
   if (callOIFill) callOIFill.style.width = `${callOIPct}%`;
 
-  const putVolSpan = root.querySelector(`#put-vol-pct-${sym}`);
+  const putVolSpan  = root.querySelector(`#put-vol-pct-${sym}`);
   const callVolSpan = root.querySelector(`#call-vol-pct-${sym}`);
   const callVolFill = root.querySelector(`#call-vol-fill-${sym}`);
   if (putVolSpan)  putVolSpan.textContent  = `PUT ${putVolPct}%`;
@@ -409,20 +415,21 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ التحديث الحساس — لا يستبدل قيمة صحيحة بقيمة فارغة */
+/* ✅ التحديث — يحمي كل قيمة من الاستبدال الفارغ */
 function updateCardOptions(symbol, opt) {
   const card = cards.find(c => c.symbol === symbol);
   if (!card) return;
 
-  // لا تستبدل قيمة صحيحة بقيمة صفر أو فارغة
+  // المصفوفات — فقط إن جاءت غير فارغة
+  if (opt.call_oi && opt.call_oi.length > 0) card.call_oi = opt.call_oi;
+  if (opt.put_oi  && opt.put_oi.length  > 0) card.put_oi  = opt.put_oi;
+  if (opt.whales  && opt.whales.length  > 0) card.whales  = opt.whales;
+
+  // total_* — للمرجع فقط (لا تُستخدم في الحسابات)
   if ((opt.total_call_oi  || 0) > 0) card.total_call_oi  = opt.total_call_oi;
   if ((opt.total_put_oi   || 0) > 0) card.total_put_oi   = opt.total_put_oi;
   if ((opt.total_call_vol || 0) > 0) card.total_call_vol = opt.total_call_vol;
   if ((opt.total_put_vol  || 0) > 0) card.total_put_vol  = opt.total_put_vol;
-
-  if (opt.call_oi && opt.call_oi.length > 0) card.call_oi = opt.call_oi;
-  if (opt.put_oi  && opt.put_oi.length  > 0) card.put_oi  = opt.put_oi;
-  if (opt.whales  && opt.whales.length  > 0) card.whales  = opt.whales;
 
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
