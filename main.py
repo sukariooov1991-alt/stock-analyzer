@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-جميع الإصلاحات مطبقة حسب وثائق Longbridge الرسمية
+مطابق لوثائق Longbridge الرسمية (v4.x)
 """
 import os
 import asyncio
@@ -71,7 +71,6 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
-    # ✅ trade_sessions (جمع) حسب وثائق Longbridge 4.x
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
@@ -80,14 +79,14 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# ✅ fetch_option_data — النسخة النهائية حسب الوثائق
+# ✅ fetch_option_data — مطابق لوثائق Longbridge
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     """
-    بنية option_chain_info_by_date حسب وثائق Longbridge:
-    - strike_price: float
-    - call: {symbol, last_done, iv, delta, gamma}
-    - put:  {symbol, last_done, iv, delta, gamma}
+    حسب وثائق Longbridge الرسمية:
+    - option_chain_info_by_date(symbol) → قائمة تواريخ الانتهاء
+    - option_chain_info_by_date(symbol, date) → قائمة بها strike, call_symbol, put_symbol
+    - option_quote([symbol]) → last, bid, ask, open_interest, delta, ...
     """
     ctx = get_ctx()
     sym = norm(symbol)
@@ -135,34 +134,27 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         if not chain:
             return result
 
-        # ===== 3) دوال استخراج (تتعامل مع البنية المتداخلة) =====
+        # ===== 3) استخراج الحقول حسب الوثائق =====
         def get_strike(c):
-            v = getattr(c, "strike_price", None)
+            v = getattr(c, "strike", None)
             if v is None:
-                v = getattr(c, "strike", None)
+                v = getattr(c, "strike_price", None)
             try:
                 return float(v) if v is not None else 0.0
             except Exception:
                 return 0.0
 
         def get_call_symbol(c):
-            # ✅ حسب الوثائق: call كائن متداخل
-            call_obj = getattr(c, "call", None)
-            if call_obj is not None:
-                return getattr(call_obj, "symbol", None)
-            # احتياط: الحقل المسطح
             return getattr(c, "call_symbol", None)
 
         def get_put_symbol(c):
-            put_obj = getattr(c, "put", None)
-            if put_obj is not None:
-                return getattr(put_obj, "symbol", None)
             return getattr(c, "put_symbol", None)
 
         # ===== 4) اختيار العقد =====
         if direction == "bullish":
             target = price * 1.015
-            cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
+            cands = [c for c in chain
+                     if get_call_symbol(c) and get_strike(c) > price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
@@ -171,7 +163,8 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             opt_type = "C"
         else:
             target = price * 0.985
-            cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
+            cands = [c for c in chain
+                     if get_put_symbol(c) and get_strike(c) < price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
@@ -186,7 +179,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             oqs = ctx.option_quote([option_symbol])
             if oqs:
                 oq = oqs[0]
-                # ✅ حسب الوثائق: الحقل last (وليس last_done)
                 for attr in ("last", "last_done", "price"):
                     v = getattr(oq, attr, None)
                     if v is not None:
@@ -418,19 +410,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
-    # ✅ مهمة keep-alive: تمنع Render من النوم
     async def keepalive_task():
         while True:
-            await asyncio.sleep(300)  # كل 5 دقائق
+            await asyncio.sleep(300)
             try:
                 get_ctx().quote(["AAPL.US"])
             except Exception:
                 pass
 
     task = asyncio.create_task(keepalive_task())
-
     yield
-
     task.cancel()
     global _quote_ctx
     _quote_ctx = None
@@ -502,7 +491,6 @@ manager = ConnectionManager()
 
 
 def _on_quote(symbol: str, event: PushQuote):
-    """Callback من Thread منفصل — نستخدم run_coroutine_threadsafe"""
     global _event_loop
     if _event_loop is None:
         return
@@ -528,7 +516,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     await manager.connect(symbol, ws)
     sym_us = norm(symbol)
 
-    # ✅ اشترك في Longbridge إذا لم يكن مشتركاً
     if sym_us not in _subscribed:
         try:
             ctx = get_ctx()
@@ -540,7 +527,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
 
     try:
         while True:
-            # ✅ انتظر رسالة من المتصفح (ping كل 30 ثانية)
             await asyncio.wait_for(ws.receive_text(), timeout=90)
     except (WebSocketDisconnect, asyncio.TimeoutError):
         manager.disconnect(symbol, ws)
