@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final + Live Options Update
+   app.js — Smooth Updates (بدون وميض)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -60,69 +60,111 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== OI Block ===== */
-function buildOIBlock(title, data, color) {
-  if (!data || !data.length) {
-    return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-empty">—</div></div>`;
-  }
-  const maxOI = Math.max(...data.map(x => x.oi || 0), 1);
-  const rows = data.map(x => {
-    const pct = ((x.oi || 0) / maxOI) * 100;
-    return `
-      <div class="oi-row">
-        <div class="oi-bar-wrap"><div class="oi-bar" style="width:${pct}%;background:${color};"></div></div>
-        <div class="oi-strike">${x.strike}</div>
+/* ===== OI Block — بنية ثابتة بـ 5 صفوف ===== */
+function buildOIBlockStatic(title, kind, color) {
+  let rows = "";
+  for (let i = 0; i < 5; i++) {
+    rows += `
+      <div class="oi-row" data-oi-row="${kind}-${i}">
+        <div class="oi-bar-wrap"><div class="oi-bar" data-oi-bar="${kind}-${i}" style="width:0%;background:${color};"></div></div>
+        <div class="oi-strike" data-oi-strike="${kind}-${i}">—</div>
       </div>`;
-  }).join("");
-  return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
-}
-
-/* ===== whale row ===== */
-function buildWhaleRow(w) {
-  const dirLabel = w.direction === "buy" ? "🟢 يشتري"
-                 : w.direction === "sell" ? "🔴 يبيع"
-                 : "⚪ محايد";
-  const typeClass = w.type === "CALL" ? "whale-call" : "whale-put";
-  const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
-  const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
+  }
   return `
-    <div class="whale-row ${typeClass}">
-      <div class="whale-strike">${w.type} ${w.strike}</div>
-      <div class="whale-vol">Vol: <b>${volFmt}</b></div>
-      <div class="whale-oi">OI: <b>${oiFmt}</b></div>
-      <div class="whale-dir">${dirLabel}</div>
+    <div class="oi-box">
+      <div class="oi-title">${title}</div>
+      <div class="oi-rows">${rows}</div>
     </div>
   `;
 }
 
-/* ===== المحتوى الموسّع (منفصل — يتحدث لحظياً) ===== */
-function buildExpandedInner(cardData) {
-  const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => `
-    <div class="tf-cell ${t.trend}">
-      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
-      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
-      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
-      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
-      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
-    </div>
-  `).join("");
+/* ===== تحديث OI Block (بدون إعادة بناء) ===== */
+function updateOIBlockData(root, kind, data) {
+  if (!root) return;
+  data = data || [];
+  const maxOI = Math.max(...data.map(x => x.oi || 0), 1);
+  for (let i = 0; i < 5; i++) {
+    const bar = root.querySelector(`[data-oi-bar="${kind}-${i}"]`);
+    const strike = root.querySelector(`[data-oi-strike="${kind}-${i}"]`);
+    if (i < data.length) {
+      const item = data[i];
+      const pct = ((item.oi || 0) / maxOI) * 100;
+      if (bar) bar.style.width = `${pct}%`;
+      if (strike) strike.textContent = item.strike;
+    } else {
+      if (bar) bar.style.width = "0%";
+      if (strike) strike.textContent = "—";
+    }
+  }
+}
 
-  const callOI = cardData.call_oi || [];
-  const putOI = cardData.put_oi || [];
-  const oiHtml = `
-    <div class="oi-grid">
-      ${buildOIBlock("PUT OI", putOI, "#8b5cf6")}
-      ${buildOIBlock("PUT LIQUIDITY", putOI.map(x => ({strike: x.strike, oi: x.volume})), "#ef4444")}
-      ${buildOIBlock("CALL OI", callOI, "#3b82f6")}
-      ${buildOIBlock("CALL LIQUIDITY", callOI.map(x => ({strike: x.strike, oi: x.volume})), "#22c55e")}
+/* ===== الحيتان — 5 صفوف ثابتة ===== */
+function buildWhalesStatic(sym) {
+  let rows = "";
+  for (let i = 0; i < 5; i++) {
+    rows += `
+      <div class="whale-row" data-whale-row="${sym}-${i}" style="display:none;">
+        <div class="whale-strike" data-whale-strike="${sym}-${i}">—</div>
+        <div class="whale-vol" data-whale-vol="${sym}-${i}">Vol: <b>—</b></div>
+        <div class="whale-oi" data-whale-oi="${sym}-${i}">OI: <b>—</b></div>
+        <div class="whale-dir" data-whale-dir="${sym}-${i}">—</div>
+      </div>`;
+  }
+  return `
+    <div class="whales-section" id="whales-${sym}" style="display:none;">
+      <div class="whales-title">🐋 الحيتان المكتشفة</div>
+      <div class="whales-list">${rows}</div>
     </div>
   `;
+}
 
-  const totalCallOI  = cardData.total_call_oi  || 0;
-  const totalPutOI   = cardData.total_put_oi   || 0;
-  const totalCallVol = cardData.total_call_vol || 0;
-  const totalPutVol  = cardData.total_put_vol  || 0;
+function updateWhalesData(root, sym, whales) {
+  if (!root) return;
+  const wrap = root.querySelector(`#whales-${sym}`);
+  if (!wrap) return;
+
+  whales = whales || [];
+
+  if (whales.length === 0) {
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "block";
+
+  for (let i = 0; i < 5; i++) {
+    const row = root.querySelector(`[data-whale-row="${sym}-${i}"]`);
+    if (!row) continue;
+
+    if (i < whales.length) {
+      const w = whales[i];
+      row.style.display = "grid";
+      row.className = "whale-row " + (w.type === "CALL" ? "whale-call" : "whale-put");
+
+      const strike = row.querySelector(`[data-whale-strike="${sym}-${i}"]`);
+      const vol = row.querySelector(`[data-whale-vol="${sym}-${i}"]`);
+      const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
+      const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
+
+      if (strike) strike.textContent = `${w.type} ${w.strike}`;
+      const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
+      const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
+      if (vol) vol.innerHTML = `Vol: <b>${volFmt}</b>`;
+      if (oi)  oi.innerHTML  = `OI: <b>${oiFmt}</b>`;
+      if (dir) dir.textContent = w.direction === "buy" ? "🟢 يشتري"
+                              : w.direction === "sell" ? "🔴 يبيع"
+                              : "⚪ محايد";
+    } else {
+      row.style.display = "none";
+    }
+  }
+}
+
+/* ===== الشرائط الكبيرة (OI + Volume) ===== */
+function updatePutCallBars(root, sym, card) {
+  const totalCallOI  = card.total_call_oi  || 0;
+  const totalPutOI   = card.total_put_oi   || 0;
+  const totalCallVol = card.total_call_vol || 0;
+  const totalPutVol  = card.total_put_vol  || 0;
 
   const totalOI = totalCallOI + totalPutOI;
   let putOIPct = 50, callOIPct = 50;
@@ -138,49 +180,34 @@ function buildExpandedInner(cardData) {
     callVolPct = 100 - putVolPct;
   }
 
-  const barHtml = `
-    <div class="putcall-wrapper">
-      <div class="putcall-label">Open Interest</div>
-      <div class="putcall-bar">
-        <span class="put">PUT ${putOIPct}%</span>
-        <div class="track"><div class="fill" style="width:${callOIPct}%"></div></div>
-        <span class="call">${callOIPct}% CALL</span>
-      </div>
-      <div class="putcall-label">Liquidity (Volume)</div>
-      <div class="putcall-bar">
-        <span class="put">PUT ${putVolPct}%</span>
-        <div class="track"><div class="fill" style="width:${callVolPct}%"></div></div>
-        <span class="call">${callVolPct}% CALL</span>
-      </div>
-    </div>
-  `;
+  const putOISpan = root.querySelector(`#put-oi-pct-${sym}`);
+  const callOISpan = root.querySelector(`#call-oi-pct-${sym}`);
+  const callOIFill = root.querySelector(`#call-oi-fill-${sym}`);
+  if (putOISpan)  putOISpan.textContent  = `PUT ${putOIPct}%`;
+  if (callOISpan) callOISpan.textContent = `${callOIPct}% CALL`;
+  if (callOIFill) callOIFill.style.width = `${callOIPct}%`;
 
-  const whales = cardData.whales || [];
-  let whaleHtml = "";
-  if (whales.length > 0) {
-    const rows = whales.map(buildWhaleRow).join("");
-    whaleHtml = `
-      <div class="whales-section">
-        <div class="whales-title">🐋 الحيتان المكتشفة</div>
-        <div class="whales-list">${rows}</div>
-      </div>
-    `;
-  }
+  const putVolSpan = root.querySelector(`#put-vol-pct-${sym}`);
+  const callVolSpan = root.querySelector(`#call-vol-pct-${sym}`);
+  const callVolFill = root.querySelector(`#call-vol-fill-${sym}`);
+  if (putVolSpan)  putVolSpan.textContent  = `PUT ${putVolPct}%`;
+  if (callVolSpan) callVolSpan.textContent = `${callVolPct}% CALL`;
+  if (callVolFill) callVolFill.style.width = `${callVolPct}%`;
+}
 
-  const price = cardData.price ?? 0;
-  return `
-    <div class="tf-grid">${tfsHtml}</div>
-    ${oiHtml}
-    ${barHtml}
-    ${whaleHtml}
-    <div class="bottom-grid">
-      <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
-      <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
-    </div>
-    <div class="summary">${buildSummary(cardData)}</div>
-  `;
+/* ===== تحديث جميع العناصر الديناميكية في root ===== */
+function updateAllDynamic(root, sym, card) {
+  if (!root || !card) return;
+  const callOI = card.call_oi || [];
+  const putOI  = card.put_oi  || [];
+
+  updateOIBlockData(root, "put-oi",   putOI);
+  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updateOIBlockData(root, "call-oi",  callOI);
+  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
+
+  updatePutCallBars(root, sym, card);
+  updateWhalesData(root, sym, card.whales || []);
 }
 
 function buildCard(cardData) {
@@ -188,14 +215,15 @@ function buildCard(cardData) {
   const lv = cardData.levels || {};
   const cls = c.color || "gray";
   const price = cardData.price ?? 0;
+  const sym = cardData.symbol;
 
   const div = document.createElement("div");
   div.className = "card " + cls;
-  div.dataset.symbol = cardData.symbol;
+  div.dataset.symbol = sym;
 
   const row1 = `
     <div class="card-row row-1">
-      <div class="cell symbol-cell">${cardData.symbol}</div>
+      <div class="cell symbol-cell">${sym}</div>
       <div class="cell price-cell">
         <div class="val">$${price.toFixed(2)}</div>
         <div class="sub">السعر الحالي</div>
@@ -234,18 +262,72 @@ function buildCard(cardData) {
     </div>
   `;
 
+  const tfs = cardData.timeframes || [];
+  const tfsHtml = tfs.map(t => `
+    <div class="tf-cell ${t.trend}">
+      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
+      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
+      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
+      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
+      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
+    </div>
+  `).join("");
+
+  const oiHtml = `
+    <div class="oi-grid">
+      ${buildOIBlockStatic("PUT OI", "put-oi", "#8b5cf6")}
+      ${buildOIBlockStatic("PUT LIQUIDITY", "put-liq", "#ef4444")}
+      ${buildOIBlockStatic("CALL OI", "call-oi", "#3b82f6")}
+      ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
+    </div>
+  `;
+
+  const barHtml = `
+    <div class="putcall-wrapper">
+      <div class="putcall-label">Open Interest</div>
+      <div class="putcall-bar">
+        <span class="put" id="put-oi-pct-${sym}">PUT 50%</span>
+        <div class="track"><div class="fill" id="call-oi-fill-${sym}" style="width:50%"></div></div>
+        <span class="call" id="call-oi-pct-${sym}">50% CALL</span>
+      </div>
+      <div class="putcall-label">Liquidity (Volume)</div>
+      <div class="putcall-bar">
+        <span class="put" id="put-vol-pct-${sym}">PUT 50%</span>
+        <div class="track"><div class="fill" id="call-vol-fill-${sym}" style="width:50%"></div></div>
+        <span class="call" id="call-vol-pct-${sym}">50% CALL</span>
+      </div>
+    </div>
+  `;
+
+  const whalesHtml = buildWhalesStatic(sym);
+
   const expanded = `
-    <div class="card-expanded">${buildExpandedInner(cardData)}</div>
+    <div class="card-expanded">
+      <div class="tf-grid">${tfsHtml}</div>
+      ${oiHtml}
+      ${barHtml}
+      ${whalesHtml}
+      <div class="bottom-grid">
+        <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
+        <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
+        <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
+        <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
+      </div>
+      <div class="summary">${buildSummary(cardData)}</div>
+    </div>
   `;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
+
+  // ✅ ملء البيانات الديناميكية الآن (بدون وميض لاحقاً)
+  updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
     if (e.target.closest(".card-trash")) return;
     div.classList.toggle("open");
   });
   div.querySelector(".card-trash").addEventListener("click", (e) => {
-    e.stopPropagation(); deleteCard(cardData.symbol);
+    e.stopPropagation(); deleteCard(sym);
   });
 
   return div;
@@ -325,13 +407,12 @@ function updateCardPrice(symbol, price) {
     card.price = price;
     const el = cardsArea.querySelector(`[data-symbol="${symbol}"] .price-cell .val`);
     if (el) el.textContent = "$" + parseFloat(price).toFixed(2);
-    // حدّث السعر في bottom-grid
     const elBottom = cardsArea.querySelector(`[data-symbol="${symbol}"] .bottom-grid .cell:last-child .val`);
     if (elBottom) elBottom.textContent = "$" + parseFloat(price).toFixed(2);
   }
 }
 
-/* ✅ تحديث الشرائط والحيتان — كل 30 ثانية */
+/* ✅ تحديث الخيارات — بدون إعادة بناء */
 function updateCardOptions(symbol, opt) {
   const card = cards.find(c => c.symbol === symbol);
   if (!card) return;
@@ -344,10 +425,11 @@ function updateCardOptions(symbol, opt) {
   if (opt.put_oi)   card.put_oi  = opt.put_oi;
   if (opt.whales)   card.whales  = opt.whales;
 
-  const expanded = cardsArea.querySelector(`[data-symbol="${symbol}"] .card-expanded`);
-  if (expanded) {
-    expanded.innerHTML = buildExpandedInner(card);
-  }
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!cardEl) return;
+  if (!cardEl.classList.contains("open")) return;
+
+  updateAllDynamic(cardEl, symbol, card);
 }
 
 async function fetchCardOptions(symbol) {
@@ -363,7 +445,6 @@ function startOptionsPolling(symbol) {
   if (optionsTimers.has(symbol)) {
     clearInterval(optionsTimers.get(symbol));
   }
-  // أول تحديث بعد 10 ثواني، ثم كل 30
   setTimeout(() => fetchCardOptions(symbol), 10000);
   const timer = setInterval(() => fetchCardOptions(symbol), 30000);
   optionsTimers.set(symbol, timer);
@@ -405,7 +486,6 @@ function connectLive(symbol) {
   socketMap.set(symbol, ws);
 }
 
-/* Polling السعر كل 5 ثواني */
 async function pollPrices() {
   for (const card of cards) {
     try {
