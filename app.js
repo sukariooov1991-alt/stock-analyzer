@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js
+   app.js — النسخة النهائية
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -22,7 +22,6 @@ const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
 
-/* الثيم */
 function applyTheme(light) {
   document.body.classList.toggle("light", light);
   themeIcon.textContent = light ? "☀️" : "🌙";
@@ -31,11 +30,9 @@ function applyTheme(light) {
 themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
 applyTheme(localStorage.getItem("theme") === "light");
 
-/* حالة السوق */
 function updateMarketStatus() {
   const now = new Date();
-  const utcH = now.getUTCHours();
-  const nyH = (utcH - 4 + 24) % 24;
+  const nyH = (now.getUTCHours() - 4 + 24) % 24;
   const total = nyH * 60 + now.getUTCMinutes();
   let label = "", cls = "status";
   if (total >= 570 && total < 960)       { label = "السوق مفتوح";    cls += " online"; }
@@ -48,7 +45,6 @@ function updateMarketStatus() {
 updateMarketStatus();
 setInterval(updateMarketStatus, 60000);
 
-/* الاتصال */
 function setConnection(online) {
   connectionStatus.className = "status " + (online ? "online" : "offline");
   connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
@@ -61,53 +57,39 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ============================================================
-   بناء شريط OI
-   ============================================================ */
+/* OI Block */
 function buildOIBlock(title, data, color) {
-  const maxOI = Math.max(...data.map(x => x.oi), 1);
+  if (!data || !data.length) {
+    return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-empty">—</div></div>`;
+  }
+  const maxOI = Math.max(...data.map(x => x.oi || 0), 1);
   const rows = data.map(x => {
-    const pct = (x.oi / maxOI) * 100;
+    const pct = ((x.oi || 0) / maxOI) * 100;
     return `
       <div class="oi-row">
-        <div class="oi-bar-wrap">
-          <div class="oi-bar" style="width:${pct}%;background:${color};"></div>
-        </div>
+        <div class="oi-bar-wrap"><div class="oi-bar" style="width:${pct}%;background:${color};"></div></div>
         <div class="oi-strike">${x.strike}</div>
-      </div>
-    `;
+      </div>`;
   }).join("");
-  return `
-    <div class="oi-box">
-      <div class="oi-title">${title}</div>
-      <div class="oi-rows">${rows}</div>
-    </div>
-  `;
+  return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
 }
 
-/* ============================================================
-   البطاقة
-   ============================================================ */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
   const cls = c.color || "gray";
   const price = cardData.price ?? 0;
-  const chg = cardData.change ?? 0;
-  const chgPct = cardData.changePercent ?? 0;
-  const sign = chg >= 0 ? "+" : "";
 
   const div = document.createElement("div");
   div.className = "card " + cls;
   div.dataset.symbol = cardData.symbol;
 
-  /* السطر 1 */
   const row1 = `
     <div class="card-row row-1">
       <div class="cell symbol-cell">${cardData.symbol}</div>
       <div class="cell price-cell">
         <div class="val">$${price.toFixed(2)}</div>
-        <div class="sub">${sign}${chg.toFixed(2)} (${sign}${chgPct.toFixed(2)}%)</div>
+        <div class="sub">السعر الحالي</div>
       </div>
       <div class="cell score-cell">
         <div class="val">${c.score ?? 0}%</div>
@@ -125,31 +107,28 @@ function buildCard(cardData) {
     </div>
   `;
 
-  /* السطر 2 */
   const row2 = `
     <div class="card-row row-2">
-      <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte ?? "—"}</div></div>
-      <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium !== "—" && lv.premium ? "$" + lv.premium : "—"}</div></div>
-      <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry ?? "—"}</div></div>
-      <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike ?? "—"}</div></div>
+      <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
+      <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
+      <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
+      <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte || "—"}</div></div>
     </div>
   `;
 
-  /* السطر 3 */
   const row3 = `
     <div class="card-row row-3">
-      <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
       <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
+      <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
+      <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
+      <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
     </div>
   `;
 
-  /* الفريمات */
   const tfs = cardData.timeframes || [];
   const tfsHtml = tfs.map(t => `
     <div class="tf-cell ${t.trend}">
-      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "↑" : "↓"}</span></div>
+      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
       <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
       <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
       <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
@@ -157,23 +136,21 @@ function buildCard(cardData) {
     </div>
   `).join("");
 
-  /* OI */
   const callOI = cardData.call_oi || [];
   const putOI = cardData.put_oi || [];
   const oiHtml = `
     <div class="oi-grid">
-      ${buildOIBlock("PUT OI", putOI, "#ef4444")}
-      ${buildOIBlock("PUT LIQUIDITY", putOI.map(x => ({...x, oi: x.volume})), "#ef4444")}
+      ${buildOIBlock("PUT OI", putOI, "#8b5cf6")}
+      ${buildOIBlock("PUT LIQUIDITY", putOI.map(x => ({strike: x.strike, oi: x.volume})), "#ef4444")}
       ${buildOIBlock("CALL OI", callOI, "#3b82f6")}
-      ${buildOIBlock("CALL LIQUIDITY", callOI.map(x => ({...x, oi: x.volume})), "#22c55e")}
+      ${buildOIBlock("CALL LIQUIDITY", callOI.map(x => ({strike: x.strike, oi: x.volume})), "#22c55e")}
     </div>
   `;
 
-  /* شريط PUT/CALL */
-  const totalCallOI = callOI.reduce((s, x) => s + x.oi, 0);
-  const totalPutOI = putOI.reduce((s, x) => s + x.oi, 0);
-  const total = totalCallOI + totalPutOI || 1;
-  const putPct = Math.round(totalPutOI / total * 100);
+  const totalCallOI = callOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const totalPutOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const total = totalCallOI + totalPutOI;
+  const putPct = total ? Math.round(totalPutOI / total * 100) : 50;
   const callPct = 100 - putPct;
 
   const barHtml = `
@@ -247,7 +224,7 @@ async function searchSymbol(symbol) {
     const r = await fetch(`${API_BASE}/api/analyze/${symbol}`);
     const d = await r.json();
     if (!r.ok) {
-      alert(`خطأ ${r.status}:\n${d.error || "غير معروف"}\n${(d.traceback||[]).slice(-3).join("\n")}`);
+      alert(`خطأ ${r.status}:\n${d.error || "غير معروف"}`);
       setConnection(false); return;
     }
     setConnection(true);
@@ -282,18 +259,9 @@ function connectLive(symbol) {
       const m = JSON.parse(ev.data);
       const card = cards.find(c => c.symbol === m.symbol);
       if (!card) return;
-      const prevClose = card.prevClose ?? card.price;
       card.price = m.price;
-      card.change = m.price - prevClose;
-      card.changePercent = prevClose ? (card.change / prevClose * 100) : 0;
-
-      const el = cardsArea.querySelector(`[data-symbol="${m.symbol}"]`);
-      if (el) {
-        el.querySelector(".price-cell .val").textContent = "$" + m.price.toFixed(2);
-        const s = card.change >= 0 ? "+" : "";
-        el.querySelector(".price-cell .sub").textContent =
-          `${s}${card.change.toFixed(2)} (${s}${card.changePercent.toFixed(2)}%)`;
-      }
+      const el = cardsArea.querySelector(`[data-symbol="${m.symbol}"] .price-cell .val`);
+      if (el) el.textContent = "$" + m.price.toFixed(2);
     } catch (e) {}
   };
   socketMap.set(symbol, ws);
