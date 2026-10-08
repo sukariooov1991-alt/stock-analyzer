@@ -1,10 +1,11 @@
 /* ============================================================
-   app.js — النسخة النهائية
+   app.js — Final
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
 const reconnectTimers = new Map();
+let pollTimer = null;
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -147,11 +148,10 @@ function buildCard(cardData) {
     </div>
   `;
 
-  /* ✅ شريط CALL/PUT — من الإجمالي الكامل للسلسلة */
+  /* ✅ الشريط من الإجمالي الحقيقي */
   const totalCall = cardData.total_call_oi || 0;
   const totalPut  = cardData.total_put_oi || 0;
   const total = totalCall + totalPut;
-
   let putPct = 50, callPct = 50;
   if (total > 0) {
     putPct = Math.round(totalPut / total * 100);
@@ -302,6 +302,20 @@ function connectLive(symbol) {
   socketMap.set(symbol, ws);
 }
 
+/* ✅ Polling كل 5 ثواني — يعمل حتى لو WebSocket ما اشتغل */
+async function pollPrices() {
+  for (const card of cards) {
+    try {
+      const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
+      if (!r.ok) continue;
+      const d = await r.json();
+      if (d.price) {
+        updateCardPrice(card.symbol, d.price);
+      }
+    } catch (e) {}
+  }
+}
+
 searchForm.addEventListener("submit", (e) => {
   e.preventDefault();
   searchSymbol(symbolInput.value);
@@ -315,4 +329,6 @@ searchForm.addEventListener("submit", (e) => {
   cards.forEach(c => connectLive(c.symbol));
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
+  setTimeout(pollPrices, 3000);
+  pollTimer = setInterval(pollPrices, 5000);  // ✅ كل 5 ثواني
 })();
