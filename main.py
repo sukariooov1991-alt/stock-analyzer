@@ -1,5 +1,5 @@
 """
-main.py — FastAPI + Longbridge + Telegram Alerts
+main.py — FastAPI + Longbridge + Telegram
 الاستراتيجية: RSI + MACD Swing (CALL + PUT)
 """
 import os
@@ -37,7 +37,7 @@ _subscribed: set[str] = set()
 _sent_alerts: set[str] = set()
 _watchlist: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
-_last_color: dict[str, str] = {}   # { symbol: "green" | "red" | ... }
+_last_color: dict[str, str] = {}
 _ANALYZE_TTL = 25
 
 WHALE_MIN_VOLUME = 3000
@@ -97,7 +97,7 @@ def fetch_candles(symbol, timeframe, count=200):
 
 
 # ============================================================
-# خيارات — نفس المنطق السابق
+# خيارات
 # ============================================================
 def _strike_of(c):
     for attr in ("strike_price", "strike", "price"):
@@ -151,6 +151,17 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         chain = ctx.option_chain_info_by_date(sym, exp_date)
         if not chain: return result
 
+        base_match = re.match(r'^([A-Z]+)', sym.replace(".US", ""))
+        base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
+        yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+        prefix = f"{base_sym}{yy}{mm}{dd}"
+
+        def build_call_sym(sk):
+            return f"{prefix}C{str(int(round(sk * 1000))).zfill(8)}.US"
+
+        def build_put_sym(sk):
+            return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
+
         if direction == "bullish":
             target = price * 1.015
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
@@ -177,23 +188,20 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
                     result["delta"] = round(float(oq.delta), 3)
         except Exception: pass
 
-        base_match = re.match(r'^([A-Z]+)', sym.replace(".US", ""))
-        base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
-
         all_call_syms, all_put_syms = [], []
+        strikes_map = {}
+
         for c in chain:
-            cs = _call_of(c); ps = _put_of(c); sk = _strike_of(c)
-            if cs: all_call_syms.append(cs)
-            elif sk > 0:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                all_call_syms.append(f"{base_sym}{yy}{mm}{dd}C{int(sk*1000)}.US")
-            if ps: all_put_syms.append(ps)
-            elif sk > 0:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                all_put_syms.append(f"{base_sym}{yy}{mm}{dd}P{int(sk*1000)}.US")
+            sk = _strike_of(c)
+            if sk <= 0: continue
+            cs = _call_of(c) or build_call_sym(sk)
+            ps = _put_of(c)  or build_put_sym(sk)
+            all_call_syms.append(cs)
+            all_put_syms.append(ps)
+            strikes_map[sk] = (cs, ps)
 
         qmap = {}
-        all_syms = all_call_syms + all_put_syms
+        all_syms = list(set(all_call_syms + all_put_syms))
         for i in range(0, len(all_syms), 30):
             try:
                 qs = ctx.option_quote(all_syms[i:i+30])
@@ -222,20 +230,13 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         cd, pd_ = [], []
         for c in nearby:
             sk = int(_strike_of(c))
-            cs = _call_of(c)
-            if not cs:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                cs = f"{base_sym}{yy}{mm}{dd}C{int(_strike_of(c)*1000)}.US"
-            if cs in qmap:
+            cs, ps = strikes_map.get(_strike_of(c), (None, None))
+            if cs and cs in qmap:
                 q = qmap[cs]
                 cd.append({"strike": sk,
                            "oi": int(getattr(q,"open_interest",0) or 0),
                            "volume": int(getattr(q,"volume",0) or 0)})
-            ps = _put_of(c)
-            if not ps:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                ps = f"{base_sym}{yy}{mm}{dd}P{int(_strike_of(c)*1000)}.US"
-            if ps in qmap:
+            if ps and ps in qmap:
                 q = qmap[ps]
                 pd_.append({"strike": sk,
                             "oi": int(getattr(q,"open_interest",0) or 0),
@@ -249,14 +250,7 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         wide = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:10]
         for c in wide:
             sk = int(_strike_of(c))
-            cs = _call_of(c)
-            if not cs:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                cs = f"{base_sym}{yy}{mm}{dd}C{int(_strike_of(c)*1000)}.US"
-            ps = _put_of(c)
-            if not ps:
-                yy=exp_date.strftime("%y"); mm=exp_date.strftime("%m"); dd=exp_date.strftime("%d")
-                ps = f"{base_sym}{yy}{mm}{dd}P{int(_strike_of(c)*1000)}.US"
+            cs, ps = strikes_map.get(_strike_of(c), (None, None))
             for sym_opt, tp_ in ((cs, "CALL"), (ps, "PUT")):
                 if not sym_opt or sym_opt not in qmap: continue
                 q = qmap[sym_opt]
@@ -277,12 +271,13 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
                                "last": round(last,2), "direction": dw})
         whales.sort(key=lambda w: w["volume"], reverse=True)
         result["whales"] = whales[:5]
-    except Exception: pass
+    except Exception as e:
+        print(f"[OPT] {e}", flush=True)
     return result
 
 
 # ============================================================
-# ✅ analyze_symbol — الاستراتيجية الجديدة
+# analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 100))
@@ -437,7 +432,7 @@ async def watchlist_checker():
         try:
             symbols = list(_watchlist)
             if symbols:
-                print(f"[WATCH] checking {len(symbols)} symbols", flush=True)
+                print(f"[WATCH] checking {len(symbols)}", flush=True)
 
             for sym in symbols:
                 try:
@@ -450,7 +445,6 @@ async def watchlist_checker():
                     prev_color = _last_color.get(sym.upper())
                     _last_color[sym.upper()] = color
 
-                    # أرسل تنبيه فقط عند التحول إلى أخضر/أحمر (وليس لكل مرة)
                     if color not in ("green", "red"):
                         continue
 
@@ -488,9 +482,8 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            send_telegram_alert("🚀 <b>محلل الأسهم</b> — النظام يعمل بالاستراتيجية الجديدة (RSI+MACD Swing)")
-        except Exception:
-            pass
+            send_telegram_alert("🚀 <b>محلل الأسهم</b> — النظام يعمل")
+        except Exception: pass
 
     async def keepalive():
         while True:
