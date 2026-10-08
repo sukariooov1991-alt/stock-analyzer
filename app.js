@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final (بدون وميض + مربعات CALL/PUT + سعر لحظي)
+   app.js — Final (تعريب المصطلحات + بدون وميض + مربعات CALL/PUT)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -125,9 +125,9 @@ function buildWhalesStatic(sym) {
       <span class="whale-sep">·</span>
       <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span>
       <span class="whale-sep">·</span>
-      <span class="whale-vol">Vol <b data-whale-vol="${sym}-${i}">—</b></span>
+      <span class="whale-vol">حجم <b data-whale-vol="${sym}-${i}">—</b></span>
       <span class="whale-sep">·</span>
-      <span class="whale-oi">OI <b data-whale-oi="${sym}-${i}">—</b></span>
+      <span class="whale-oi">مفتوحة <b data-whale-oi="${sym}-${i}">—</b></span>
       <span class="whale-sep">·</span>
       <span class="whale-dir" data-whale-dir="${sym}-${i}">—</span>
     </div>`;
@@ -161,7 +161,7 @@ function updateWhalesData(root, sym, whales) {
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
 
-      if (type) type.textContent = w.type;
+      if (type) type.textContent = w.type === "CALL" ? "شراء" : "بيع";
       if (strike) strike.textContent = w.strike;
 
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
@@ -198,8 +198,8 @@ function updatePutCallBoxes(root, sym, card) {
     const el = root.querySelector(`#${id}-${sym}`);
     if (el) el.textContent = val + "%";
   };
-  setPct("pcbox-call-oi", callOIPct);
-  setPct("pcbox-put-oi",  putOIPct);
+  setPct("pcbox-call-oi",  callOIPct);
+  setPct("pcbox-put-oi",   putOIPct);
   setPct("pcbox-call-vol", callVolPct);
   setPct("pcbox-put-vol",  putVolPct);
 }
@@ -244,7 +244,7 @@ function buildSummaryBar(cardData) {
       <span class="summary-sep">·</span>
       <span class="summary-item">ADX <b>${adx}</b> ${adxOk ? "✅" : "❌"}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">VOL ${volOk ? "✅" : "❌"}</span>
+      <span class="summary-item">الحجم ${volOk ? "✅" : "❌"}</span>
     </div>
   `;
 }
@@ -285,17 +285,17 @@ function buildCard(cardData) {
   </div>`;
 
   const row2 = `<div class="card-row row-2">
-    <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte || "—"}</div></div>
-    <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
-    <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
-    <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
+    <div class="cell"><div class="label">الأيام</div><div class="val">${lv.dte || "—"}</div></div>
+    <div class="cell"><div class="label">سعر العقد</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
+    <div class="cell"><div class="label">الانتهاء</div><div class="val">${lv.expiry || "—"}</div></div>
+    <div class="cell"><div class="label">التنفيذ</div><div class="val">${lv.strike || "—"}</div></div>
   </div>`;
 
   const row3 = `<div class="card-row row-3">
-    <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
-    <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
-    <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
-    <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
+    <div class="cell"><div class="label">الوقف</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
+    <div class="cell"><div class="label">الهدف 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
+    <div class="cell"><div class="label">الهدف 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
+    <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
   const tfs = cardData.timeframes || [];
@@ -309,28 +309,28 @@ function buildCard(cardData) {
     </div>`).join("");
 
   const oiHtml = `<div class="oi-grid">
-    ${buildOIBlockStatic("PUT OI", "put-oi", "#8b5cf6")}
-    ${buildOIBlockStatic("PUT LIQUIDITY", "put-liq", "#ef4444")}
-    ${buildOIBlockStatic("CALL OI", "call-oi", "#3b82f6")}
-    ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
+    ${buildOIBlockStatic("مفتوحة - بيع", "put-oi", "#8b5cf6")}
+    ${buildOIBlockStatic("سيولة - بيع", "put-liq", "#ef4444")}
+    ${buildOIBlockStatic("مفتوحة - شراء", "call-oi", "#3b82f6")}
+    ${buildOIBlockStatic("سيولة - شراء", "call-liq", "#22c55e")}
   </div>`;
 
   const boxesHtml = `
     <div class="putcall-boxes">
       <div class="pcbox pcbox-call">
-        <div class="pcbox-label">CALL OI</div>
+        <div class="pcbox-label">مفتوحة - شراء</div>
         <div class="pcbox-pct" id="pcbox-call-oi-${sym}">50%</div>
       </div>
       <div class="pcbox pcbox-put">
-        <div class="pcbox-label">PUT OI</div>
+        <div class="pcbox-label">مفتوحة - بيع</div>
         <div class="pcbox-pct" id="pcbox-put-oi-${sym}">50%</div>
       </div>
       <div class="pcbox pcbox-call">
-        <div class="pcbox-label">CALL VOL</div>
+        <div class="pcbox-label">حجم - شراء</div>
         <div class="pcbox-pct" id="pcbox-call-vol-${sym}">50%</div>
       </div>
       <div class="pcbox pcbox-put">
-        <div class="pcbox-label">PUT VOL</div>
+        <div class="pcbox-label">حجم - بيع</div>
         <div class="pcbox-pct" id="pcbox-put-vol-${sym}">50%</div>
       </div>
     </div>`;
@@ -368,29 +368,26 @@ function buildCard(cardData) {
 /* ===== التحديث داخل المكان (بدون إعادة بناء) ===== */
 function updateCardInPlace(cardEl, newData) {
   const c = newData.card || {};
-  const lv = newData.levels || {};
   const sym = newData.symbol;
   const price = newData.price ?? 0;
 
-  // 1. اللون
-  cardEl.className = "card " + (c.color || "gray");
-  if (cardEl.classList.contains("open")) cardEl.classList.add("open");
+  // ✅ احفظ حالة الفتح
+  const wasOpen = cardEl.classList.contains("open");
 
-  // 2. الشارة
+  cardEl.className = "card " + (c.color || "gray");
+  if (wasOpen) cardEl.classList.add("open");
+
   const badge = cardEl.querySelector("[data-badge]");
   if (badge) badge.textContent = "🔥 " + (c.label || "—");
 
-  // 3. النقاط
   const score = cardEl.querySelector("[data-score]");
   if (score) score.textContent = (c.score ?? 0) + "%";
 
-  // 4. السعر (الرأس + الأسفل)
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
   const btmPrice = cardEl.querySelector("[data-btm-price]");
   if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
 
-  // 5. الفريمات
   const tfs = newData.timeframes || [];
   tfs.forEach((t, idx) => {
     const cell = cardEl.querySelector(`[data-tf-cell="${idx}"]`);
@@ -408,7 +405,6 @@ function updateCardInPlace(cardEl, newData) {
     if (rvolEl) rvolEl.textContent = t.rvol + "x";
   });
 
-  // 6. VWAP / دعوم / مقاومات
   const vwapEl = cardEl.querySelector("[data-btm-vwap]");
   if (vwapEl) vwapEl.textContent = "$" + (newData.vwap ?? "—");
   const resEl = cardEl.querySelector("[data-btm-res]");
@@ -416,14 +412,11 @@ function updateCardInPlace(cardEl, newData) {
   const supEl = cardEl.querySelector("[data-btm-sup]");
   if (supEl) supEl.textContent = (newData.supports || []).join(" / ") || "—";
 
-  // 7. OI + مربعات CALL/PUT + الحيتان
   updateAllDynamic(cardEl, sym, newData);
 
-  // 8. الشريط السفلي
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
   if (sumWrap) sumWrap.innerHTML = buildSummaryBar(newData);
 
-  // 9. الصوت
   checkSound(sym, c.color);
 }
 
@@ -491,7 +484,6 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ التحديث — بدون إعادة بناء */
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
