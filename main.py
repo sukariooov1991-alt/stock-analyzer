@@ -11,8 +11,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse
 
 from longbridge.openapi import (
     Config, QuoteContext, Period, AdjustType,
@@ -28,7 +27,7 @@ from analysis import (
 )
 
 # ============================================================
-# الإعدادات — من متغيرات البيئة (Render / .env محلياً)
+# الإعدادات
 # ============================================================
 LB_KEY    = os.environ.get("LONGBRIDGE_APP_KEY", "")
 LB_SECRET = os.environ.get("LONGBRIDGE_APP_SECRET", "")
@@ -56,10 +55,7 @@ def norm(symbol: str) -> str:
     return s if "." in s else f"{s}.US"
 
 
-# ============================================================
-# تحويل شموع Longbridge إلى DataFrame
-# ============================================================
-def candles_to_df(candles) -> "pd.DataFrame":
+def candles_to_df(candles):
     import pandas as pd
     rows = [{
         "time":   c.timestamp,
@@ -69,13 +65,9 @@ def candles_to_df(candles) -> "pd.DataFrame":
         "close":  float(c.close),
         "volume": int(c.volume),
     } for c in candles]
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
-# ============================================================
-# جلب الشموع من Longbridge
-# ============================================================
 PERIOD_MAP = {
     "15m": Period.Min_15,
     "1h":  Period.Min_60,
@@ -91,27 +83,20 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
     return ctx.candlesticks(
-        norm(symbol),
-        period,
-        count,
+        norm(symbol), period, count,
         AdjustType.NoAdjust,
         trade_session=TradeSessions.Intraday,
     )
 
 
-# ============================================================
-# الحساب الكامل للبطاقة
-# ============================================================
 def analyze_symbol(symbol: str) -> dict:
     import pandas as pd
 
-    # 1) جلب الشموع لكل الفريمات المطلوبة
     df_15m = candles_to_df(fetch_candles(symbol, "15m", 300))
     df_1h  = candles_to_df(fetch_candles(symbol, "1h",  300))
     df_4h  = candles_to_df(fetch_candles(symbol, "4h",  300))
     df_1d  = candles_to_df(fetch_candles(symbol, "1d",  300))
 
-    # 2) حساب المؤشرات على كل فريم
     def enrich(df):
         df["ema20"] = ema(df["close"], 20)
         df["ema50"] = ema(df["close"], 50)
@@ -123,13 +108,9 @@ def analyze_symbol(symbol: str) -> dict:
 
     df_15m, df_1h, df_4h, df_1d = map(enrich, [df_15m, df_1h, df_4h, df_1d])
 
-    # 3) السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
 
-    # 4) تحديد الفريم القيادي وفريم التنفيذ
-    #    إذا الاتجاه واضح على 1D → الاستراتيجية اليومية (1D + 15m)
-    #    وإلا → الأسبوعية (1W/4H + 1H)
     trend_1d = df_1d["close"].iloc[-1] > df_1d["ema50"].iloc[-1]
     use_daily = trend_1d
 
@@ -138,23 +119,19 @@ def analyze_symbol(symbol: str) -> dict:
     else:
         htf_df, exec_df, exec_tf = df_4h, df_1h, "1h"
 
-    # 5) مستوى السيولة: قاع آخر شمعة على الفريم القيادي
     prev = htf_df.iloc[-2]
     prev_low  = float(prev["low"])
     prev_high = float(prev["high"])
 
-    # 6) سحب السيولة على فريم التنفيذ
     sweep = detect_sweep(exec_df, prev_low, "low")
     direction = "bullish"
     if sweep is None:
         sweep = detect_sweep(exec_df, prev_high, "high")
         direction = "bearish" if sweep else "bullish"
 
-    # 7) IFVG
     atr_series = exec_df["atr"]
     ifvg = find_ifvg(exec_df, atr_series, direction) if sweep else None
 
-    # 8) MSS
     mss = False
     if sweep:
         if direction == "bullish":
@@ -166,19 +143,16 @@ def analyze_symbol(symbol: str) -> dict:
             last_sl = sl[-1] if sl else None
             mss = check_mss(exec_df, last_sl, "bearish")
 
-    # 9) الفلاتر الإضافية
     trend_ok = (direction == "bullish" and trend_1d) or (direction == "bearish" and not trend_1d)
-    rth_ok = True  # TODO: تحديد الجلسة الرسمية من timestamp
+    rth_ok = True
     atr_val = float(exec_df["atr"].iloc[-1])
     momentum_ok = check_momentum(exec_df, atr_val) if sweep else False
     retest_ok = check_retest(exec_df, ifvg) if ifvg else False
 
-    # 10) النقاط
     score = calculate_score(sweep, ifvg, trend_ok, rth_ok, momentum_ok, retest_ok)
     card = classify_card(sweep, ifvg, direction)
     card["score"] = score
 
-    # 11) المستويات
     levels = {}
     if ifvg and sweep:
         entry = ifvg["top"] if direction == "bullish" else ifvg["bottom"]
@@ -190,18 +164,17 @@ def analyze_symbol(symbol: str) -> dict:
             atr_val=atr_val,
         )
 
-    # 12) لقطة الفريمات
     def tf_snapshot(df, label):
         r = df.iloc[-1]
         up = float(r["ema20"]) > float(r["ema50"])
         return {
-            "label":    label,
-            "trend":    "up" if up else "down",
-            "ema20":    round(float(r["ema20"]), 2),
-            "ema50":    round(float(r["ema50"]), 2),
-            "rsi":      round(float(r["rsi"]), 1),
-            "adx":      round(float(r["adx"]), 1),
-            "rvol":     round(rvol(df), 2),
+            "label": label,
+            "trend": "up" if up else "down",
+            "ema20": round(float(r["ema20"]), 2),
+            "ema50": round(float(r["ema50"]), 2),
+            "rsi":   round(float(r["rsi"]), 1),
+            "adx":   round(float(r["adx"]), 1),
+            "rvol":  round(rvol(df), 2),
         }
 
     timeframes = [
@@ -211,7 +184,6 @@ def analyze_symbol(symbol: str) -> dict:
         tf_snapshot(df_15m, "15M"),
     ]
 
-    # 13) VWAP + دعوم/مقاومات
     last = exec_df.iloc[-1]
     supports = [
         round(float(exec_df["low"].iloc[-20:].min()), 2),
@@ -240,9 +212,6 @@ def analyze_symbol(symbol: str) -> dict:
     }
 
 
-# ============================================================
-# FastAPI App
-# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     get_ctx()
@@ -261,11 +230,9 @@ app.add_middleware(
 )
 
 
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "stock-analyzer"}
-
-
+# ============================================================
+# API
+# ============================================================
 @app.get("/api/health")
 def health():
     return {"status": "healthy"}
@@ -280,7 +247,7 @@ def analyze(symbol: str):
 
 
 # ============================================================
-# WebSocket — Live
+# WebSocket
 # ============================================================
 class ConnectionManager:
     def __init__(self):
@@ -307,7 +274,6 @@ _subscribed: set[str] = set()
 
 
 def _on_quote(symbol: str, event: PushQuote):
-    """Callback من Longbridge — يبث للمتصفحات"""
     msg = {
         "symbol":   symbol.replace(".US", ""),
         "price":    float(event.last_done),
@@ -329,7 +295,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     symbol = symbol.upper()
     await manager.connect(symbol, ws)
 
-    # اشترك في Longbridge إذا لم يكن مشتركاً
     sym_us = norm(symbol)
     if sym_us not in _subscribed:
         ctx = get_ctx()
@@ -342,6 +307,24 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
             await ws.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(symbol, ws)
+
+
+# ============================================================
+# الواجهة (HTML/CSS/JS)
+# ============================================================
+@app.get("/")
+def index():
+    return FileResponse("index.html")
+
+
+@app.get("/style.css")
+def css():
+    return FileResponse("style.css")
+
+
+@app.get("/app.js")
+def js():
+    return FileResponse("app.js")
 
 
 if __name__ == "__main__":
