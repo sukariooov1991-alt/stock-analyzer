@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final (كبسولات الحيتان + شريط مدمج مرتب)
+   app.js — Final (بدون وميض + مربعات CALL/PUT + سعر لحظي)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -47,9 +47,7 @@ function playAlertSound(type) {
 
 function checkSound(symbol, color) {
   const prev = lastAlertedState[symbol];
-  if ((color === "green" || color === "red") && prev !== color) {
-    playAlertSound(color);
-  }
+  if ((color === "green" || color === "red") && prev !== color) playAlertSound(color);
   lastAlertedState[symbol] = color;
 }
 
@@ -92,7 +90,7 @@ async function checkBackendStatus() {
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
-    rows += `<div class="oi-row" data-oi-row="${kind}-${i}">
+    rows += `<div class="oi-row">
       <div class="oi-bar-wrap"><div class="oi-bar" data-oi-bar="${kind}-${i}" style="width:0%;background:${color};"></div></div>
       <div class="oi-strike" data-oi-strike="${kind}-${i}">—</div>
     </div>`;
@@ -107,18 +105,18 @@ function updateOIBlockData(root, kind, data) {
   for (let i = 0; i < 5; i++) {
     const bar = root.querySelector(`[data-oi-bar="${kind}-${i}"]`);
     const strike = root.querySelector(`[data-oi-strike="${kind}-${i}"]`);
+    if (!bar || !strike) continue;
     if (i < data.length) {
-      const pct = ((data[i].oi || 0) / maxOI) * 100;
-      if (bar) bar.style.width = `${pct}%`;
-      if (strike) strike.textContent = data[i].strike;
+      bar.style.width = `${((data[i].oi || 0) / maxOI) * 100}%`;
+      strike.textContent = data[i].strike;
     } else {
-      if (bar) bar.style.width = "0%";
-      if (strike) strike.textContent = "—";
+      bar.style.width = "0%";
+      strike.textContent = "—";
     }
   }
 }
 
-/* ===== الحيتان — كبسولات ===== */
+/* ===== الحيتان ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -179,34 +177,31 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-function updatePutCallBars(root, sym, card) {
+/* ===== مربعات CALL/PUT ===== */
+function updatePutCallBoxes(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
-  const totalCallOI  = callOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const totalPutOI   = putOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const totalCallVol = callOI.reduce((s, x) => s + (x.volume || 0), 0);
-  const totalPutVol  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const tCOI = callOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const tPOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
+  const tCV  = callOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const tPV  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
 
-  const totalOI = totalCallOI + totalPutOI;
-  let putOIPct = 50, callOIPct = 50;
-  if (totalOI > 0) { putOIPct = Math.round(totalPutOI / totalOI * 100); callOIPct = 100 - putOIPct; }
-  const totalVol = totalCallVol + totalPutVol;
-  let putVolPct = 50, callVolPct = 50;
-  if (totalVol > 0) { putVolPct = Math.round(totalPutVol / totalVol * 100); callVolPct = 100 - putVolPct; }
+  const totOI = tCOI + tPOI;
+  let callOIPct = 50, putOIPct = 50;
+  if (totOI > 0) { callOIPct = Math.round(tCOI / totOI * 100); putOIPct = 100 - callOIPct; }
 
-  const putOISpan  = root.querySelector(`#put-oi-pct-${sym}`);
-  const callOISpan = root.querySelector(`#call-oi-pct-${sym}`);
-  const callOIFill = root.querySelector(`#call-oi-fill-${sym}`);
-  if (putOISpan)  putOISpan.textContent  = `PUT ${putOIPct}%`;
-  if (callOISpan) callOISpan.textContent = `${callOIPct}% CALL`;
-  if (callOIFill) callOIFill.style.width = `${callOIPct}%`;
+  const totV = tCV + tPV;
+  let callVolPct = 50, putVolPct = 50;
+  if (totV > 0) { callVolPct = Math.round(tCV / totV * 100); putVolPct = 100 - callVolPct; }
 
-  const putVolSpan  = root.querySelector(`#put-vol-pct-${sym}`);
-  const callVolSpan = root.querySelector(`#call-vol-pct-${sym}`);
-  const callVolFill = root.querySelector(`#call-vol-fill-${sym}`);
-  if (putVolSpan)  putVolSpan.textContent  = `PUT ${putVolPct}%`;
-  if (callVolSpan) callVolSpan.textContent = `${callVolPct}% CALL`;
-  if (callVolFill) callVolFill.style.width = `${callVolPct}%`;
+  const setPct = (id, val) => {
+    const el = root.querySelector(`#${id}-${sym}`);
+    if (el) el.textContent = val + "%";
+  };
+  setPct("pcbox-call-oi", callOIPct);
+  setPct("pcbox-put-oi",  putOIPct);
+  setPct("pcbox-call-vol", callVolPct);
+  setPct("pcbox-put-vol",  putVolPct);
 }
 
 function updateAllDynamic(root, sym, card) {
@@ -217,11 +212,11 @@ function updateAllDynamic(root, sym, card) {
   updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
   updateOIBlockData(root, "call-oi",  callOI);
   updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updatePutCallBars(root, sym, card);
+  updatePutCallBoxes(root, sym, card);
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ✅ الشريط المدمج — صف واحد مرتب */
+/* ===== الشريط السفلي المدمج ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -234,15 +229,11 @@ function buildSummaryBar(cardData) {
   const volOk = !!c.volume_ok;
 
   const macdIcon = (typeof macd === "number")
-    ? (macd > 0 ? "🟢" : macd < 0 ? "🔴" : "⚪")
-    : "⚪";
+    ? (macd > 0 ? "🟢" : macd < 0 ? "🔴" : "⚪") : "⚪";
 
   let rsiIcon = "⏸️";
   if (c.status === "call") rsiIcon = "🟢";
   else if (c.status === "put") rsiIcon = "🔴";
-
-  const adxIcon = adxOk ? "✅" : "❌";
-  const volIcon = volOk ? "✅" : "❌";
 
   return `
     <div class="summary-bar">
@@ -251,13 +242,14 @@ function buildSummaryBar(cardData) {
       <span class="summary-sep">·</span>
       <span class="summary-item">RSI <b>${rsi}</b> ${rsiIcon}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">ADX <b>${adx}</b> ${adxIcon}</span>
+      <span class="summary-item">ADX <b>${adx}</b> ${adxOk ? "✅" : "❌"}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">VOL ${volIcon}</span>
+      <span class="summary-item">VOL ${volOk ? "✅" : "❌"}</span>
     </div>
   `;
 }
 
+/* ===== بناء البطاقة ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -270,20 +262,19 @@ function buildCard(cardData) {
   const div = document.createElement("div");
   div.className = "card " + cls;
   div.dataset.symbol = sym;
-  if (window._skipCardAnim) div.style.animation = "none";
 
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
     <div class="cell price-cell">
-      <div class="val">$${price.toFixed(2)}</div>
+      <div class="val" data-price>$${price.toFixed(2)}</div>
       <div class="sub">السعر الحالي</div>
     </div>
     <div class="cell score-cell">
-      <div class="val">${c.score ?? 0}%</div>
+      <div class="val" data-score>${c.score ?? 0}%</div>
       <div class="sub">قوة الإشارة</div>
     </div>
     <div class="cell badge-cell">
-      <div class="badge">🔥 ${c.label || "—"}</div>
+      <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
       <button class="card-trash">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="3 6 5 6 21 6"></polyline>
@@ -308,13 +299,13 @@ function buildCard(cardData) {
   </div>`;
 
   const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => `
-    <div class="tf-cell ${t.trend}">
-      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
-      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
-      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
-      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
-      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
+  const tfsHtml = tfs.map((t, idx) => `
+    <div class="tf-cell ${t.trend}" data-tf-cell="${idx}">
+      <div class="tf-label"><span>${t.label}</span><span data-tf-trend>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
+      <div class="tf-row"><span>EMA</span><span class="v" data-tf-ema>${t.ema20}/${t.ema50}</span></div>
+      <div class="tf-row"><span>RSI</span><span class="v" data-tf-rsi>${t.rsi}</span></div>
+      <div class="tf-row"><span>ADX</span><span class="v" data-tf-adx>${t.adx}</span></div>
+      <div class="tf-row"><span>RVOL</span><span class="v" data-tf-rvol>${t.rvol}x</span></div>
     </div>`).join("");
 
   const oiHtml = `<div class="oi-grid">
@@ -324,35 +315,40 @@ function buildCard(cardData) {
     ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
   </div>`;
 
-  const barHtml = `<div class="putcall-wrapper">
-    <div class="putcall-label">Open Interest</div>
-    <div class="putcall-bar">
-      <span class="put" id="put-oi-pct-${sym}">PUT 50%</span>
-      <div class="track"><div class="fill" id="call-oi-fill-${sym}" style="width:50%"></div></div>
-      <span class="call" id="call-oi-pct-${sym}">50% CALL</span>
-    </div>
-    <div class="putcall-label">Liquidity (Volume)</div>
-    <div class="putcall-bar">
-      <span class="put" id="put-vol-pct-${sym}">PUT 50%</span>
-      <div class="track"><div class="fill" id="call-vol-fill-${sym}" style="width:50%"></div></div>
-      <span class="call" id="call-vol-pct-${sym}">50% CALL</span>
-    </div>
-  </div>`;
+  const boxesHtml = `
+    <div class="putcall-boxes">
+      <div class="pcbox pcbox-call">
+        <div class="pcbox-label">CALL OI</div>
+        <div class="pcbox-pct" id="pcbox-call-oi-${sym}">50%</div>
+      </div>
+      <div class="pcbox pcbox-put">
+        <div class="pcbox-label">PUT OI</div>
+        <div class="pcbox-pct" id="pcbox-put-oi-${sym}">50%</div>
+      </div>
+      <div class="pcbox pcbox-call">
+        <div class="pcbox-label">CALL VOL</div>
+        <div class="pcbox-pct" id="pcbox-call-vol-${sym}">50%</div>
+      </div>
+      <div class="pcbox pcbox-put">
+        <div class="pcbox-label">PUT VOL</div>
+        <div class="pcbox-pct" id="pcbox-put-vol-${sym}">50%</div>
+      </div>
+    </div>`;
 
   const whalesHtml = buildWhalesStatic(sym);
 
   const expanded = `<div class="card-expanded">
     <div class="tf-grid">${tfsHtml}</div>
     ${oiHtml}
-    ${barHtml}
+    ${boxesHtml}
     ${whalesHtml}
     <div class="bottom-grid">
-      <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
-      <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
+      <div class="cell"><div class="label">VWAP</div><div class="val" data-btm-vwap>$${cardData.vwap ?? "—"}</div></div>
+      <div class="cell"><div class="label">مقاومات</div><div class="val" data-btm-res>${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">دعوم</div><div class="val" data-btm-sup>${(cardData.supports||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">السعر</div><div class="val" data-btm-price>$${price.toFixed(2)}</div></div>
     </div>
-    ${buildSummaryBar(cardData)}
+    <div data-summary-wrap>${buildSummaryBar(cardData)}</div>
   </div>`;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
@@ -367,6 +363,68 @@ function buildCard(cardData) {
   });
 
   return div;
+}
+
+/* ===== التحديث داخل المكان (بدون إعادة بناء) ===== */
+function updateCardInPlace(cardEl, newData) {
+  const c = newData.card || {};
+  const lv = newData.levels || {};
+  const sym = newData.symbol;
+  const price = newData.price ?? 0;
+
+  // 1. اللون
+  cardEl.className = "card " + (c.color || "gray");
+  if (cardEl.classList.contains("open")) cardEl.classList.add("open");
+
+  // 2. الشارة
+  const badge = cardEl.querySelector("[data-badge]");
+  if (badge) badge.textContent = "🔥 " + (c.label || "—");
+
+  // 3. النقاط
+  const score = cardEl.querySelector("[data-score]");
+  if (score) score.textContent = (c.score ?? 0) + "%";
+
+  // 4. السعر (الرأس + الأسفل)
+  const priceEl = cardEl.querySelector("[data-price]");
+  if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
+  const btmPrice = cardEl.querySelector("[data-btm-price]");
+  if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
+
+  // 5. الفريمات
+  const tfs = newData.timeframes || [];
+  tfs.forEach((t, idx) => {
+    const cell = cardEl.querySelector(`[data-tf-cell="${idx}"]`);
+    if (!cell) return;
+    cell.className = "tf-cell " + t.trend;
+    const trendEl = cell.querySelector("[data-tf-trend]");
+    if (trendEl) trendEl.textContent = t.trend === "up" ? "صاعد ↑" : "هابط ↓";
+    const emaEl = cell.querySelector("[data-tf-ema]");
+    if (emaEl) emaEl.textContent = `${t.ema20}/${t.ema50}`;
+    const rsiEl = cell.querySelector("[data-tf-rsi]");
+    if (rsiEl) rsiEl.textContent = t.rsi;
+    const adxEl = cell.querySelector("[data-tf-adx]");
+    if (adxEl) adxEl.textContent = t.adx;
+    const rvolEl = cell.querySelector("[data-tf-rvol]");
+    if (rvolEl) rvolEl.textContent = t.rvol + "x";
+  });
+
+  // 6. VWAP / دعوم / مقاومات
+  const vwapEl = cardEl.querySelector("[data-btm-vwap]");
+  if (vwapEl) vwapEl.textContent = "$" + (newData.vwap ?? "—");
+  const resEl = cardEl.querySelector("[data-btm-res]");
+  if (resEl) resEl.textContent = (newData.resistances || []).join(" / ") || "—";
+  const supEl = cardEl.querySelector("[data-btm-sup]");
+  if (supEl) supEl.textContent = (newData.supports || []).join(" / ") || "—";
+
+  // 7. OI + مربعات CALL/PUT + الحيتان
+  updateAllDynamic(cardEl, sym, newData);
+
+  // 8. الشريط السفلي
+  const sumWrap = cardEl.querySelector("[data-summary-wrap]");
+  if (sumWrap) sumWrap.innerHTML = buildSummaryBar(newData);
+
+  // 9. الصوت
+  checkSound(sym, c.color);
 }
 
 function renderCards() {
@@ -424,28 +482,23 @@ function updateCardPrice(symbol, price) {
   if (!card) return;
   if (price && price > 0 && price !== card.price) {
     card.price = price;
-    const el = cardsArea.querySelector(`[data-symbol="${symbol}"] .price-cell .val`);
-    if (el) el.textContent = "$" + parseFloat(price).toFixed(2);
+    const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+    if (!cardEl) return;
+    const priceEl = cardEl.querySelector("[data-price]");
+    if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
+    const btmPrice = cardEl.querySelector("[data-btm-price]");
+    if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
   }
 }
 
-/* ✅ تحديث ذكي — بدون وميض */
+/* ✅ التحديث — بدون إعادة بناء */
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
-  const newColor = newData.card?.color;
   cards[idx] = newData;
-
-  const oldEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (oldEl) {
-    const wasOpen = oldEl.classList.contains("open");
-    window._skipCardAnim = true;
-    const newEl = buildCard(newData);
-    if (wasOpen) newEl.classList.add("open");
-    oldEl.replaceWith(newEl);
-    window._skipCardAnim = false;
-  }
-  checkSound(symbol, newColor);
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!cardEl) return;
+  updateCardInPlace(cardEl, newData);
 }
 
 async function fetchState(symbol) {
