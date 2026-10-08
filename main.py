@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-مطابق لوثائق Longbridge الرسمية (v4.x)
+النسخة النهائية — كل التعديلات مطبقة
 """
 import os
 import asyncio
@@ -71,24 +71,18 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
-    # ✅ trade_session (مفرد) حسب الوثائق
+    # ✅ كل الجلسات (pre + regular + after + overnight)
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
-        trade_sessions=TradeSessions.Intraday,
+        trade_sessions=TradeSessions.All,
     )
 
 
 # ============================================================
-# ✅ fetch_option_data — مطابق للوثائق (البنية المتداخلة)
+# fetch_option_data — نسخة تشخيصية شاملة
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
-    """
-    بنية option_chain_info_by_date:
-    - strike_price: float
-    - call: {symbol, last_done, iv, delta, gamma}
-    - put:  {symbol, last_done, iv, delta, gamma}
-    """
     ctx = get_ctx()
     sym = norm(symbol)
 
@@ -96,149 +90,189 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         "strike": "—", "expiry": "—", "dte": "—", "premium": "—",
         "delta": None,
         "call_oi": [], "put_oi": [],
+        "_debug": [],
     }
 
+    def log(m):
+        result["_debug"].append(str(m))
+
+    # ===== 1) تواريخ الانتهاء =====
     try:
-        # ===== 1) تواريخ الانتهاء =====
         raw_dates = ctx.option_chain_info_by_date(sym)
-        if not raw_dates:
-            return result
+        log(f"1. dates type={type(raw_dates).__name__} len={len(raw_dates) if raw_dates else 0}")
+        if raw_dates:
+            log(f"   sample={[str(x) for x in raw_dates[:3]]}")
+    except Exception as e:
+        log(f"1. ERROR {type(e).__name__}: {e}")
+        return result
 
-        today = datetime.now(timezone.utc).date()
-        target_dte = 37 if strategy == "daily" else 52
+    if not raw_dates:
+        log("1. dates empty")
+        return result
 
-        parsed_dates = []
-        for d in raw_dates:
-            if isinstance(d, date_cls):
-                if d > today:
-                    parsed_dates.append(d)
-            elif isinstance(d, str):
-                try:
-                    dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
-                    if dd > today:
-                        parsed_dates.append(dd)
-                except Exception:
-                    continue
+    today = datetime.now(timezone.utc).date()
+    target_dte = 37 if strategy == "daily" else 52
 
-        if not parsed_dates:
-            return result
+    parsed_dates = []
+    for d in raw_dates:
+        if isinstance(d, date_cls):
+            if d > today:
+                parsed_dates.append(d)
+        elif isinstance(d, str):
+            try:
+                dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
+                if dd > today:
+                    parsed_dates.append(dd)
+            except Exception:
+                continue
 
-        exp_date, dte = min(
-            [(d, (d - today).days) for d in parsed_dates],
-            key=lambda x: abs(x[1] - target_dte)
-        )
-        result["expiry"] = exp_date.strftime("%b %d").upper()
-        result["dte"] = dte
+    log(f"2. parsed={len(parsed_dates)}")
+    if not parsed_dates:
+        log("2. no future dates")
+        return result
 
-        # ===== 2) سلسلة العقود =====
+    exp_date, dte = min(
+        [(d, (d - today).days) for d in parsed_dates],
+        key=lambda x: abs(x[1] - target_dte)
+    )
+    result["expiry"] = exp_date.strftime("%b %d").upper()
+    result["dte"] = dte
+    log(f"2. picked {exp_date} dte={dte}")
+
+    # ===== 3) سلسلة العقود =====
+    try:
         chain = ctx.option_chain_info_by_date(sym, exp_date.isoformat())
-        if not chain:
+        log(f"3. chain type={type(chain).__name__} len={len(chain) if chain else 0}")
+        if chain:
+            c0 = chain[0]
+            log(f"3. attrs={[a for a in dir(c0) if not a.startswith('_')][:20]}")
+            for a in ("strike", "strike_price", "call_symbol", "put_symbol", "call", "put"):
+                log(f"3. {a}={getattr(c0, a, 'N/A')!r}")
+    except Exception as e:
+        log(f"3. ERROR {type(e).__name__}: {e}")
+        return result
+
+    if not chain:
+        log("3. chain empty")
+        return result
+
+    def get_strike(c):
+        for attr in ("strike_price", "strike", "price"):
+            v = getattr(c, attr, None)
+            if v is not None:
+                try:
+                    return float(v)
+                except Exception:
+                    pass
+        return 0.0
+
+    def get_call_symbol(c):
+        v = getattr(c, "call_symbol", None)
+        if v: return v
+        co = getattr(c, "call", None)
+        if co is not None:
+            return getattr(co, "symbol", None)
+        return None
+
+    def get_put_symbol(c):
+        v = getattr(c, "put_symbol", None)
+        if v: return v
+        po = getattr(c, "put", None)
+        if po is not None:
+            return getattr(po, "symbol", None)
+        return None
+
+    # ===== 4) اختيار العقد =====
+    if direction == "bullish":
+        target = price * 1.015
+        cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
+        if not cands:
+            log(f"4. no calls > {price}")
             return result
+        best = min(cands, key=lambda c: abs(get_strike(c) - target))
+        option_symbol = get_call_symbol(best)
+        strike = get_strike(best)
+        opt_type = "C"
+    else:
+        target = price * 0.985
+        cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
+        if not cands:
+            log(f"4. no puts < {price}")
+            return result
+        best = min(cands, key=lambda c: abs(get_strike(c) - target))
+        option_symbol = get_put_symbol(best)
+        strike = get_strike(best)
+        opt_type = "P"
 
-        # ===== 3) استخراج الحقول (البنية المتداخلة) =====
-        def get_strike(c):
-            v = getattr(c, "strike_price", None)
-            try:
-                return float(v) if v is not None else 0.0
-            except Exception:
-                return 0.0
+    result["strike"] = f"{opt_type} {int(strike)}"
+    log(f"4. ✅ {result['strike']} symbol={option_symbol}")
 
-        def get_call_obj(c):
-            return getattr(c, "call", None)
+    # ===== 5) سعر العقد =====
+    try:
+        oqs = ctx.option_quote([option_symbol])
+        log(f"5. option_quote len={len(oqs) if oqs else 0}")
+        if oqs:
+            oq = oqs[0]
+            log(f"5. attrs={[a for a in dir(oq) if not a.startswith('_')][:25]}")
+            for attr in ("last_done", "last", "price"):
+                v = getattr(oq, attr, None)
+                if v is not None:
+                    result["premium"] = round(float(v), 2)
+                    log(f"5. ✅ premium={result['premium']} (from {attr})")
+                    break
+            if hasattr(oq, "delta"):
+                result["delta"] = round(float(oq.delta), 3)
+    except Exception as e:
+        log(f"5. ERROR {type(e).__name__}: {e}")
 
-        def get_put_obj(c):
-            return getattr(c, "put", None)
+    # ===== 6) OI و Volume =====
+    nearby = sorted(chain, key=lambda c: abs(get_strike(c) - price))[:5]
+    call_syms, put_syms = [], []
+    for c in nearby:
+        cs = get_call_symbol(c)
+        ps = get_put_symbol(c)
+        if cs: call_syms.append(cs)
+        if ps: put_syms.append(ps)
 
-        def get_call_symbol(c):
-            co = get_call_obj(c)
-            return getattr(co, "symbol", None) if co else None
+    all_syms = call_syms + put_syms
+    log(f"6. nearby={len(nearby)} calls={len(call_syms)} puts={len(put_syms)}")
 
-        def get_put_symbol(c):
-            po = get_put_obj(c)
-            return getattr(po, "symbol", None) if po else None
-
-        # ===== 4) اختيار العقد =====
-        if direction == "bullish":
-            target = price * 1.015
-            cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
-            if not cands:
-                return result
-            best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = get_call_symbol(best)
-            strike = get_strike(best)
-            opt_type = "C"
-        else:
-            target = price * 0.985
-            cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
-            if not cands:
-                return result
-            best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = get_put_symbol(best)
-            strike = get_strike(best)
-            opt_type = "P"
-
-        result["strike"] = f"{opt_type} {int(strike)}"
-
-        # ===== 5) سعر العقد =====
+    if all_syms:
         try:
-            oqs = ctx.option_quote([option_symbol])
-            if oqs:
-                oq = oqs[0]
-                # ✅ حسب الوثائق: الحقل last_done
-                for attr in ("last_done", "last", "price"):
-                    v = getattr(oq, attr, None)
-                    if v is not None:
-                        result["premium"] = round(float(v), 2)
-                        break
-                if hasattr(oq, "delta"):
-                    result["delta"] = round(float(oq.delta), 3)
-        except Exception:
-            pass
+            qs = ctx.option_quote(all_syms)
+            log(f"6. quotes={len(qs) if qs else 0}")
+            qmap = {q.symbol: q for q in qs} if qs else {}
 
-        # ===== 6) OI و Volume للعقود القريبة =====
-        nearby = sorted(chain, key=lambda c: abs(get_strike(c) - price))[:5]
+            if qs:
+                q0 = qs[0]
+                log(f"6. q0 oi={getattr(q0, 'open_interest', 'N/A')} vol={getattr(q0, 'volume', 'N/A')}")
 
-        call_syms, put_syms = [], []
-        for c in nearby:
-            cs = get_call_symbol(c)
-            ps = get_put_symbol(c)
-            if cs: call_syms.append(cs)
-            if ps: put_syms.append(ps)
+            call_data, put_data = [], []
+            for c in nearby:
+                cs = get_call_symbol(c)
+                ps = get_put_symbol(c)
+                if cs and cs in qmap:
+                    q = qmap[cs]
+                    call_data.append({
+                        "strike": int(get_strike(c)),
+                        "oi": int(getattr(q, "open_interest", 0) or 0),
+                        "volume": int(getattr(q, "volume", 0) or 0),
+                    })
+                if ps and ps in qmap:
+                    q = qmap[ps]
+                    put_data.append({
+                        "strike": int(get_strike(c)),
+                        "oi": int(getattr(q, "open_interest", 0) or 0),
+                        "volume": int(getattr(q, "volume", 0) or 0),
+                    })
 
-        all_syms = call_syms + put_syms
-        if all_syms:
-            try:
-                qs = ctx.option_quote(all_syms)
-                qmap = {q.symbol: q for q in qs} if qs else {}
-
-                call_data, put_data = [], []
-                for c in nearby:
-                    cs = get_call_symbol(c)
-                    ps = get_put_symbol(c)
-                    if cs and cs in qmap:
-                        q = qmap[cs]
-                        call_data.append({
-                            "strike": int(get_strike(c)),
-                            "oi": int(getattr(q, "open_interest", 0) or 0),
-                            "volume": int(getattr(q, "volume", 0) or 0),
-                        })
-                    if ps and ps in qmap:
-                        q = qmap[ps]
-                        put_data.append({
-                            "strike": int(get_strike(c)),
-                            "oi": int(getattr(q, "open_interest", 0) or 0),
-                            "volume": int(getattr(q, "volume", 0) or 0),
-                        })
-
-                call_data.sort(key=lambda x: x["strike"], reverse=True)
-                put_data.sort(key=lambda x: x["strike"], reverse=True)
-                result["call_oi"] = call_data
-                result["put_oi"] = put_data
-            except Exception:
-                pass
-
-    except Exception:
-        pass
+            call_data.sort(key=lambda x: x["strike"], reverse=True)
+            put_data.sort(key=lambda x: x["strike"], reverse=True)
+            result["call_oi"] = call_data
+            result["put_oi"] = put_data
+            log(f"6. ✅ call_oi={len(call_data)} put_oi={len(put_data)}")
+        except Exception as e:
+            log(f"6. ERROR {type(e).__name__}: {e}")
 
     return result
 
@@ -400,6 +434,7 @@ def analyze_symbol(symbol: str) -> dict:
         "mss":     mss,
         "call_oi": opt.get("call_oi", []),
         "put_oi":  opt.get("put_oi", []),
+        "opt_debug": opt.get("_debug", []),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -471,7 +506,7 @@ def analyze(symbol: str):
 
 
 # ============================================================
-# WebSocket مع إعادة الاتصال
+# WebSocket — كل الجلسات
 # ============================================================
 class ConnectionManager:
     def __init__(self):
@@ -526,7 +561,13 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
         try:
             ctx = get_ctx()
             ctx.set_on_quote(_on_quote)
-            ctx.subscribe([sym_us], [SubType.Quote], is_first_push=True)
+            # ✅ كل الجلسات (overnight + pre + regular + after)
+            ctx.subscribe(
+                [sym_us],
+                [SubType.Quote],
+                is_first_push=True,
+                trade_sessions=TradeSessions.All,
+            )
             _subscribed.add(sym_us)
         except Exception:
             pass
