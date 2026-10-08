@@ -175,7 +175,6 @@ def _build_options_payload(chain, qmap, price):
     call_data.sort(key=lambda x: x["strike"], reverse=True)
     put_data.sort(key=lambda x: x["strike"], reverse=True)
 
-    # الحيتان
     whales = []
     wide = sorted(chain, key=lambda c: abs(_get_strike(c) - price))[:10]
     for c in wide:
@@ -219,7 +218,6 @@ def _build_options_payload(chain, qmap, price):
 
 
 def _fetch_full_chain(sym, exp_date):
-    """يجلب السلسلة ويجمع كل الـ quotes"""
     ctx = get_ctx()
     chain = ctx.option_chain_info_by_date(sym, exp_date)
     if not chain:
@@ -246,9 +244,6 @@ def _fetch_full_chain(sym, exp_date):
     return chain, qmap
 
 
-# ============================================================
-# fetch_option_data — النسخة الكاملة (للتحليل الأولي)
-# ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
     sym = norm(symbol)
@@ -280,7 +275,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         if not chain:
             return result
 
-        # اختيار العقد الرئيسي
         if direction == "bullish":
             target = price * 1.015
             cands = [c for c in chain if _get_call_symbol(c) and _get_strike(c) > price]
@@ -321,42 +315,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         pass
 
     return result
-
-
-# ============================================================
-# ✅ endpoint خفيف للتحديث اللحظي
-# ============================================================
-@app.get("/api/options/{symbol}")
-def options_live(symbol: str):
-    """يُرجع فقط OI/Volume/Whales — لتحديث البطاقة كل 30 ثانية"""
-    try:
-        ctx = get_ctx()
-        sym = norm(symbol)
-
-        q = ctx.quote([sym])
-        price = float(q[0].last_done) if q else 0.0
-
-        raw_dates = ctx.option_chain_expiry_date_list(sym)
-        if not raw_dates:
-            return JSONResponse(status_code=404, content={"error": "no dates"})
-
-        today = datetime.now(timezone.utc).date()
-        exp_date, dte = _parse_expiries(raw_dates, today, 37)
-        if not exp_date:
-            return JSONResponse(status_code=404, content={"error": "no future dates"})
-
-        chain, qmap = _fetch_full_chain(sym, exp_date)
-        if not chain:
-            return JSONResponse(status_code=404, content={"error": "no chain"})
-
-        payload = _build_options_payload(chain, qmap, price)
-        payload["expiry"] = exp_date.strftime("%b %d").upper()
-        payload["dte"] = dte
-        payload["price"] = round(price, 2)
-        return payload
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 def compute_levels(entry, sweep_level, ifvg_bottom, htf_target, atr_val, direction="bullish"):
@@ -495,6 +453,9 @@ def analyze_symbol(symbol: str) -> dict:
     }
 
 
+# ============================================================
+# ✅ تعريف app أولاً
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _event_loop
@@ -532,6 +493,9 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# ✅ كل endpoints — الآن بعد تعريف app
+# ============================================================
 @app.get("/api/status")
 def status(symbol: str = Query("AAPL")):
     try:
@@ -558,6 +522,39 @@ def analyze(symbol: str):
             "error": str(e), "type": type(e).__name__,
             "traceback": traceback.format_exc().split("\n")[-10:],
         })
+
+
+# ✅ endpoint خفيف لتحديث الشرائط والحيتان
+@app.get("/api/options/{symbol}")
+def options_live(symbol: str):
+    try:
+        ctx = get_ctx()
+        sym = norm(symbol)
+
+        q = ctx.quote([sym])
+        price = float(q[0].last_done) if q else 0.0
+
+        raw_dates = ctx.option_chain_expiry_date_list(sym)
+        if not raw_dates:
+            return JSONResponse(status_code=404, content={"error": "no dates"})
+
+        today = datetime.now(timezone.utc).date()
+        exp_date, dte = _parse_expiries(raw_dates, today, 37)
+        if not exp_date:
+            return JSONResponse(status_code=404, content={"error": "no future dates"})
+
+        chain, qmap = _fetch_full_chain(sym, exp_date)
+        if not chain:
+            return JSONResponse(status_code=404, content={"error": "no chain"})
+
+        payload = _build_options_payload(chain, qmap, price)
+        payload["expiry"] = exp_date.strftime("%b %d").upper()
+        payload["dte"] = dte
+        payload["price"] = round(price, 2)
+        return payload
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.get("/api/price/{symbol}")
