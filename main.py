@@ -79,7 +79,7 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# ✅ fetch_option_data — النسخة الصحيحة
+# fetch_option_data
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
@@ -95,13 +95,10 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
     def log(m):
         result["_debug"].append(str(m))
 
-    # ===== 1) تواريخ الانتهاء — الدالة الصحيحة =====
+    # ===== 1) تواريخ الانتهاء =====
     try:
-        # ✅ الدالة الصحيحة للحصول على قائمة التواريخ
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         log(f"1. dates type={type(raw_dates).__name__} len={len(raw_dates) if raw_dates else 0}")
-        if raw_dates:
-            log(f"   sample={[str(x) for x in raw_dates[:3]]}")
     except Exception as e:
         log(f"1. ERROR {type(e).__name__}: {e}")
         return result
@@ -139,9 +136,10 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
     result["dte"] = dte
     log(f"2. picked {exp_date} dte={dte}")
 
-    # ===== 3) سلسلة العقود =====
+    # ===== 3) سلسلة العقود — تمرير كائن date وليس string =====
     try:
-        chain = ctx.option_chain_info_by_date(sym, exp_date.isoformat())
+        # ✅ الحل: نمرر exp_date مباشرة (كائن date) بدون .isoformat()
+        chain = ctx.option_chain_info_by_date(sym, exp_date)
         log(f"3. chain type={type(chain).__name__} len={len(chain) if chain else 0}")
         if chain:
             c0 = chain[0]
@@ -213,7 +211,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         log(f"5. option_quote len={len(oqs) if oqs else 0}")
         if oqs:
             oq = oqs[0]
-            log(f"5. attrs={[a for a in dir(oq) if not a.startswith('_')][:25]}")
             for attr in ("last_done", "last", "price"):
                 v = getattr(oq, attr, None)
                 if v is not None:
@@ -242,10 +239,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             qs = ctx.option_quote(all_syms)
             log(f"6. quotes={len(qs) if qs else 0}")
             qmap = {q.symbol: q for q in qs} if qs else {}
-
-            if qs:
-                q0 = qs[0]
-                log(f"6. q0 oi={getattr(q0, 'open_interest', 'N/A')} vol={getattr(q0, 'volume', 'N/A')}")
 
             call_data, put_data = [], []
             for c in nearby:
