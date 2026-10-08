@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-جميع الإصلاحات مطبقة
+جميع الإصلاحات مطبقة حسب وثائق Longbridge الرسمية
 """
 import os
 import asyncio
@@ -30,6 +30,7 @@ _lb_config = Config.from_apikey_env()
 
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
+_subscribed: set[str] = set()
 
 
 def get_ctx() -> QuoteContext:
@@ -70,6 +71,7 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
+    # ✅ trade_sessions (جمع) حسب وثائق Longbridge 4.x
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
@@ -78,14 +80,14 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# ✅ fetch_option_data — النسخة المصححة حسب الوثائق الرسمية
+# ✅ fetch_option_data — النسخة النهائية حسب الوثائق
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     """
-    جلب بيانات الأوبشن حسب وثائق Longbridge الرسمية:
-    - option_chain_info_by_date(symbol) → قائمة تواريخ الانتهاء
-    - option_chain_info_by_date(symbol, date) → قائمة Strikes مع call_symbol/put_symbol
-    - option_quote([symbol]) → آخر سعر + delta + open_interest + volume
+    بنية option_chain_info_by_date حسب وثائق Longbridge:
+    - strike_price: float
+    - call: {symbol, last_done, iv, delta, gamma}
+    - put:  {symbol, last_done, iv, delta, gamma}
     """
     ctx = get_ctx()
     sym = norm(symbol)
@@ -133,55 +135,75 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         if not chain:
             return result
 
-        # ✅ حسب الوثائق: الحقل اسمه strike وليس strike_price
+        # ===== 3) دوال استخراج (تتعامل مع البنية المتداخلة) =====
         def get_strike(c):
-            return float(getattr(c, "strike", 0) or getattr(c, "strike_price", 0) or 0)
+            v = getattr(c, "strike_price", None)
+            if v is None:
+                v = getattr(c, "strike", None)
+            try:
+                return float(v) if v is not None else 0.0
+            except Exception:
+                return 0.0
 
-        # ===== 3) اختيار الـ Strike =====
+        def get_call_symbol(c):
+            # ✅ حسب الوثائق: call كائن متداخل
+            call_obj = getattr(c, "call", None)
+            if call_obj is not None:
+                return getattr(call_obj, "symbol", None)
+            # احتياط: الحقل المسطح
+            return getattr(c, "call_symbol", None)
+
+        def get_put_symbol(c):
+            put_obj = getattr(c, "put", None)
+            if put_obj is not None:
+                return getattr(put_obj, "symbol", None)
+            return getattr(c, "put_symbol", None)
+
+        # ===== 4) اختيار العقد =====
         if direction == "bullish":
             target = price * 1.015
-            cands = [c for c in chain
-                     if getattr(c, "call_symbol", None)
-                     and get_strike(c) > price]
+            cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = best.call_symbol
+            option_symbol = get_call_symbol(best)
             strike = get_strike(best)
             opt_type = "C"
         else:
             target = price * 0.985
-            cands = [c for c in chain
-                     if getattr(c, "put_symbol", None)
-                     and get_strike(c) < price]
+            cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = best.put_symbol
+            option_symbol = get_put_symbol(best)
             strike = get_strike(best)
             opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # ===== 4) سعر العقد + Delta =====
+        # ===== 5) سعر العقد =====
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
                 oq = oqs[0]
-                # ✅ حسب الوثائق: الحقل last_done وليس last
-                result["premium"] = round(float(getattr(oq, "last_done", 0)), 2)
+                # ✅ حسب الوثائق: الحقل last (وليس last_done)
+                for attr in ("last", "last_done", "price"):
+                    v = getattr(oq, attr, None)
+                    if v is not None:
+                        result["premium"] = round(float(v), 2)
+                        break
                 if hasattr(oq, "delta"):
                     result["delta"] = round(float(oq.delta), 3)
         except Exception:
             pass
 
-        # ===== 5) OI و Volume للعقود القريبة =====
+        # ===== 6) OI و Volume للعقود القريبة =====
         nearby = sorted(chain, key=lambda c: abs(get_strike(c) - price))[:5]
 
         call_syms, put_syms = [], []
         for c in nearby:
-            cs = getattr(c, "call_symbol", None)
-            ps = getattr(c, "put_symbol", None)
+            cs = get_call_symbol(c)
+            ps = get_put_symbol(c)
             if cs: call_syms.append(cs)
             if ps: put_syms.append(ps)
 
@@ -191,22 +213,19 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
                 qs = ctx.option_quote(all_syms)
                 qmap = {q.symbol: q for q in qs} if qs else {}
 
-                call_data = []
+                call_data, put_data = [], []
                 for c in nearby:
-                    s = getattr(c, "call_symbol", None)
-                    if s and s in qmap:
-                        q = qmap[s]
+                    cs = get_call_symbol(c)
+                    ps = get_put_symbol(c)
+                    if cs and cs in qmap:
+                        q = qmap[cs]
                         call_data.append({
                             "strike": int(get_strike(c)),
                             "oi": int(getattr(q, "open_interest", 0) or 0),
                             "volume": int(getattr(q, "volume", 0) or 0),
                         })
-
-                put_data = []
-                for c in nearby:
-                    s = getattr(c, "put_symbol", None)
-                    if s and s in qmap:
-                        q = qmap[s]
+                    if ps and ps in qmap:
+                        q = qmap[ps]
                         put_data.append({
                             "strike": int(get_strike(c)),
                             "oi": int(getattr(q, "open_interest", 0) or 0),
@@ -227,7 +246,7 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
 
 
 # ============================================================
-# ✅ compute_levels — إصلاح منطق TARGET 2
+# compute_levels
 # ============================================================
 def compute_levels(entry, sweep_level, ifvg_bottom, htf_target, atr_val, direction="bullish"):
     stop = min(sweep_level, ifvg_bottom) - 0.1 * atr_val if direction == "bullish" \
@@ -236,7 +255,6 @@ def compute_levels(entry, sweep_level, ifvg_bottom, htf_target, atr_val, directi
 
     if direction == "bullish":
         t1 = entry + 2 * risk
-        # ✅ TARGET 2 يجب أن يكون أعلى من TARGET 1
         t2 = max(htf_target, entry + 3 * risk)
     else:
         t1 = entry - 2 * risk
@@ -316,7 +334,6 @@ def analyze_symbol(symbol: str) -> dict:
     card = classify_card(sweep, ifvg, direction)
     card["score"] = score
 
-    # ===== المستويات =====
     if ifvg and sweep:
         entry = ifvg["top"] if direction == "bullish" else ifvg["bottom"]
         stop_level = min(sweep["sweep"], ifvg["bottom"]) if direction == "bullish" \
@@ -328,15 +345,10 @@ def analyze_symbol(symbol: str) -> dict:
         htf_target = prev_high if direction == "bullish" else prev_low
 
     levels = compute_levels(
-        entry=entry,
-        sweep_level=stop_level,
-        ifvg_bottom=stop_level,
-        htf_target=htf_target,
-        atr_val=atr_val,
-        direction=direction,
+        entry=entry, sweep_level=stop_level, ifvg_bottom=stop_level,
+        htf_target=htf_target, atr_val=atr_val, direction=direction,
     )
 
-    # ===== بيانات الأوبشن =====
     opt = fetch_option_data(symbol, direction, price, strategy)
     levels["strike"]  = opt.get("strike", "—")
     levels["expiry"]  = opt.get("expiry", "—")
@@ -395,7 +407,7 @@ def analyze_symbol(symbol: str) -> dict:
 
 
 # ============================================================
-# FastAPI
+# FastAPI + Keep-Alive
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -405,7 +417,21 @@ async def lifespan(app: FastAPI):
         get_ctx()
     except Exception:
         pass
+
+    # ✅ مهمة keep-alive: تمنع Render من النوم
+    async def keepalive_task():
+        while True:
+            await asyncio.sleep(300)  # كل 5 دقائق
+            try:
+                get_ctx().quote(["AAPL.US"])
+            except Exception:
+                pass
+
+    task = asyncio.create_task(keepalive_task())
+
     yield
+
+    task.cancel()
     global _quote_ctx
     _quote_ctx = None
 
@@ -429,9 +455,7 @@ def status():
             return {"connected": True, "price": str(q[0].last_done), "symbol": q[0].symbol}
         return {"connected": False, "error": "لا توجد بيانات"}
     except Exception as e:
-        return JSONResponse(status_code=503, content={
-            "connected": False, "error": str(e), "type": type(e).__name__,
-        })
+        return JSONResponse(status_code=503, content={"connected": False, "error": str(e)})
 
 
 @app.get("/api/health")
@@ -452,7 +476,7 @@ def analyze(symbol: str):
 
 
 # ============================================================
-# WebSocket
+# WebSocket مع إعادة الاتصال
 # ============================================================
 class ConnectionManager:
     def __init__(self):
@@ -475,7 +499,6 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
-_subscribed: set[str] = set()
 
 
 def _on_quote(symbol: str, event: PushQuote):
@@ -504,6 +527,8 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     symbol = symbol.upper()
     await manager.connect(symbol, ws)
     sym_us = norm(symbol)
+
+    # ✅ اشترك في Longbridge إذا لم يكن مشتركاً
     if sym_us not in _subscribed:
         try:
             ctx = get_ctx()
@@ -512,10 +537,12 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
             _subscribed.add(sym_us)
         except Exception:
             pass
+
     try:
         while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
+            # ✅ انتظر رسالة من المتصفح (ping كل 30 ثانية)
+            await asyncio.wait_for(ws.receive_text(), timeout=90)
+    except (WebSocketDisconnect, asyncio.TimeoutError):
         manager.disconnect(symbol, ws)
 
 
