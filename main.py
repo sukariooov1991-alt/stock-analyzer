@@ -71,22 +71,23 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
+    # ✅ trade_session (مفرد) حسب الوثائق
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
-        trade_sessions=TradeSessions.Intraday,
+        trade_session=TradeSessions.Intraday,
     )
 
 
 # ============================================================
-# ✅ fetch_option_data — مطابق لوثائق Longbridge
+# ✅ fetch_option_data — مطابق للوثائق (البنية المتداخلة)
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     """
-    حسب وثائق Longbridge الرسمية:
-    - option_chain_info_by_date(symbol) → قائمة تواريخ الانتهاء
-    - option_chain_info_by_date(symbol, date) → قائمة بها strike, call_symbol, put_symbol
-    - option_quote([symbol]) → last, bid, ask, open_interest, delta, ...
+    بنية option_chain_info_by_date:
+    - strike_price: float
+    - call: {symbol, last_done, iv, delta, gamma}
+    - put:  {symbol, last_done, iv, delta, gamma}
     """
     ctx = get_ctx()
     sym = norm(symbol)
@@ -134,27 +135,32 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         if not chain:
             return result
 
-        # ===== 3) استخراج الحقول حسب الوثائق =====
+        # ===== 3) استخراج الحقول (البنية المتداخلة) =====
         def get_strike(c):
-            v = getattr(c, "strike", None)
-            if v is None:
-                v = getattr(c, "strike_price", None)
+            v = getattr(c, "strike_price", None)
             try:
                 return float(v) if v is not None else 0.0
             except Exception:
                 return 0.0
 
+        def get_call_obj(c):
+            return getattr(c, "call", None)
+
+        def get_put_obj(c):
+            return getattr(c, "put", None)
+
         def get_call_symbol(c):
-            return getattr(c, "call_symbol", None)
+            co = get_call_obj(c)
+            return getattr(co, "symbol", None) if co else None
 
         def get_put_symbol(c):
-            return getattr(c, "put_symbol", None)
+            po = get_put_obj(c)
+            return getattr(po, "symbol", None) if po else None
 
         # ===== 4) اختيار العقد =====
         if direction == "bullish":
             target = price * 1.015
-            cands = [c for c in chain
-                     if get_call_symbol(c) and get_strike(c) > price]
+            cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
@@ -163,8 +169,7 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             opt_type = "C"
         else:
             target = price * 0.985
-            cands = [c for c in chain
-                     if get_put_symbol(c) and get_strike(c) < price]
+            cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
             if not cands:
                 return result
             best = min(cands, key=lambda c: abs(get_strike(c) - target))
@@ -179,7 +184,8 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             oqs = ctx.option_quote([option_symbol])
             if oqs:
                 oq = oqs[0]
-                for attr in ("last", "last_done", "price"):
+                # ✅ حسب الوثائق: الحقل last_done
+                for attr in ("last_done", "last", "price"):
                     v = getattr(oq, attr, None)
                     if v is not None:
                         result["premium"] = round(float(v), 2)
