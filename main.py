@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-مع تحديث لحظي للشرائط والحيتان
+السعر اللحظي + OI + Volume + الحيتان
 """
 import os
 import asyncio
@@ -82,9 +82,9 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# دوال مشتركة للأوبشن
+# دوال مساعدة للخيارات
 # ============================================================
-def _get_strike(c):
+def _strike_of(c):
     for attr in ("strike_price", "strike", "price"):
         v = getattr(c, attr, None)
         if v is not None:
@@ -95,7 +95,7 @@ def _get_strike(c):
     return 0.0
 
 
-def _get_call_symbol(c):
+def _call_of(c):
     v = getattr(c, "call_symbol", None)
     if v: return v
     co = getattr(c, "call", None)
@@ -104,7 +104,7 @@ def _get_call_symbol(c):
     return None
 
 
-def _get_put_symbol(c):
+def _put_of(c):
     v = getattr(c, "put_symbol", None)
     if v: return v
     po = getattr(c, "put", None)
@@ -113,137 +113,9 @@ def _get_put_symbol(c):
     return None
 
 
-def _parse_expiries(raw_dates, today, target_dte):
-    parsed = []
-    for d in raw_dates:
-        if isinstance(d, date_cls):
-            if d > today:
-                parsed.append(d)
-        elif isinstance(d, str):
-            try:
-                dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
-                if dd > today:
-                    parsed.append(dd)
-            except Exception:
-                continue
-    if not parsed:
-        return None, None
-    return min([(d, (d - today).days) for d in parsed], key=lambda x: abs(x[1] - target_dte))
-
-
-def _build_options_payload(chain, qmap, price):
-    """يبني OI/Volume/Whales من السلسلة"""
-    all_call_syms, all_put_syms = [], []
-    for c in chain:
-        cs = _get_call_symbol(c)
-        ps = _get_put_symbol(c)
-        if cs: all_call_syms.append(cs)
-        if ps: all_put_syms.append(ps)
-
-    total_call_oi = total_put_oi = total_call_vol = total_put_vol = 0
-    for s in all_call_syms:
-        if s in qmap:
-            q = qmap[s]
-            total_call_oi  += int(getattr(q, "open_interest", 0) or 0)
-            total_call_vol += int(getattr(q, "volume", 0) or 0)
-    for s in all_put_syms:
-        if s in qmap:
-            q = qmap[s]
-            total_put_oi  += int(getattr(q, "open_interest", 0) or 0)
-            total_put_vol += int(getattr(q, "volume", 0) or 0)
-
-    nearby = sorted(chain, key=lambda c: abs(_get_strike(c) - price))[:5]
-    call_data, put_data = [], []
-    for c in nearby:
-        cs = _get_call_symbol(c)
-        ps = _get_put_symbol(c)
-        sk = int(_get_strike(c))
-        if cs and cs in qmap:
-            q = qmap[cs]
-            call_data.append({
-                "strike": sk,
-                "oi": int(getattr(q, "open_interest", 0) or 0),
-                "volume": int(getattr(q, "volume", 0) or 0),
-            })
-        if ps and ps in qmap:
-            q = qmap[ps]
-            put_data.append({
-                "strike": sk,
-                "oi": int(getattr(q, "open_interest", 0) or 0),
-                "volume": int(getattr(q, "volume", 0) or 0),
-            })
-    call_data.sort(key=lambda x: x["strike"], reverse=True)
-    put_data.sort(key=lambda x: x["strike"], reverse=True)
-
-    whales = []
-    wide = sorted(chain, key=lambda c: abs(_get_strike(c) - price))[:10]
-    for c in wide:
-        cs = _get_call_symbol(c)
-        ps = _get_put_symbol(c)
-        sk = int(_get_strike(c))
-        for sym_opt, opt_type in ((cs, "CALL"), (ps, "PUT")):
-            if not sym_opt or sym_opt not in qmap:
-                continue
-            q = qmap[sym_opt]
-            vol = int(getattr(q, "volume", 0) or 0)
-            oi  = int(getattr(q, "open_interest", 0) or 0)
-            if vol < WHALE_MIN_VOLUME and oi < WHALE_MIN_OI:
-                continue
-            bid = float(getattr(q, "bid", 0) or 0)
-            ask = float(getattr(q, "ask", 0) or 0)
-            last = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
-            direction_w = "mid"
-            if ask > bid > 0:
-                spread = ask - bid
-                pos = (last - bid) / spread if spread > 0 else 0.5
-                if pos >= 0.7:   direction_w = "buy"
-                elif pos <= 0.3: direction_w = "sell"
-            whales.append({
-                "strike": sk, "type": opt_type,
-                "volume": vol, "oi": oi,
-                "bid": round(bid, 2), "ask": round(ask, 2), "last": round(last, 2),
-                "direction": direction_w,
-            })
-    whales.sort(key=lambda w: w["volume"], reverse=True)
-
-    return {
-        "call_oi": call_data,
-        "put_oi": put_data,
-        "total_call_oi": total_call_oi,
-        "total_put_oi": total_put_oi,
-        "total_call_vol": total_call_vol,
-        "total_put_vol": total_put_vol,
-        "whales": whales[:5],
-    }
-
-
-def _fetch_full_chain(sym, exp_date):
-    ctx = get_ctx()
-    chain = ctx.option_chain_info_by_date(sym, exp_date)
-    if not chain:
-        return None, {}
-
-    all_syms = []
-    for c in chain:
-        cs = _get_call_symbol(c)
-        ps = _get_put_symbol(c)
-        if cs: all_syms.append(cs)
-        if ps: all_syms.append(ps)
-
-    qmap = {}
-    BATCH = 100
-    for i in range(0, len(all_syms), BATCH):
-        batch = all_syms[i:i + BATCH]
-        try:
-            qs = ctx.option_quote(batch)
-            if qs:
-                for q in qs:
-                    qmap[q.symbol] = q
-        except Exception:
-            pass
-    return chain, qmap
-
-
+# ============================================================
+# ✅ fetch_option_data — منطق OI كما في النسخة التي عملت + vol + whales
+# ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
     sym = norm(symbol)
@@ -264,36 +136,55 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
 
         today = datetime.now(timezone.utc).date()
         target_dte = 37 if strategy == "daily" else 52
-        exp_date, dte = _parse_expiries(raw_dates, today, target_dte)
-        if not exp_date:
+
+        parsed = []
+        for d in raw_dates:
+            if isinstance(d, date_cls):
+                if d > today:
+                    parsed.append(d)
+            elif isinstance(d, str):
+                try:
+                    dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
+                    if dd > today:
+                        parsed.append(dd)
+                except Exception:
+                    continue
+
+        if not parsed:
             return result
 
+        exp_date, dte = min(
+            [(d, (d - today).days) for d in parsed],
+            key=lambda x: abs(x[1] - target_dte)
+        )
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
-        chain, qmap = _fetch_full_chain(sym, exp_date)
+        chain = ctx.option_chain_info_by_date(sym, exp_date)
         if not chain:
             return result
 
+        # اختيار العقد الرئيسي
         if direction == "bullish":
             target = price * 1.015
-            cands = [c for c in chain if _get_call_symbol(c) and _get_strike(c) > price]
+            cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
             if not cands: return result
-            best = min(cands, key=lambda c: abs(_get_strike(c) - target))
-            option_symbol = _get_call_symbol(best)
-            strike = _get_strike(best)
+            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
+            option_symbol = _call_of(best)
+            strike = _strike_of(best)
             opt_type = "C"
         else:
             target = price * 0.985
-            cands = [c for c in chain if _get_put_symbol(c) and _get_strike(c) < price]
+            cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
             if not cands: return result
-            best = min(cands, key=lambda c: abs(_get_strike(c) - target))
-            option_symbol = _get_put_symbol(best)
-            strike = _get_strike(best)
+            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
+            option_symbol = _put_of(best)
+            strike = _strike_of(best)
             opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
+        # سعر العقد الرئيسي
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -308,8 +199,110 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         except Exception:
             pass
 
-        payload = _build_options_payload(chain, qmap, price)
-        result.update(payload)
+        # ============================================================
+        # ✅ منطق OI الأصلي (الذي عمل)
+        # ============================================================
+        all_call_syms, all_put_syms = [], []
+        for c in chain:
+            cs = _call_of(c)
+            ps = _put_of(c)
+            if cs: all_call_syms.append(cs)
+            if ps: all_put_syms.append(ps)
+
+        qmap = {}
+        all_syms = all_call_syms + all_put_syms
+        BATCH = 50
+        for i in range(0, len(all_syms), BATCH):
+            batch = all_syms[i:i + BATCH]
+            try:
+                qs = ctx.option_quote(batch)
+                if qs:
+                    for q in qs:
+                        qmap[q.symbol] = q
+            except Exception:
+                pass
+
+        total_call_oi = total_put_oi = 0
+        total_call_vol = total_put_vol = 0
+        for s in all_call_syms:
+            if s in qmap:
+                q = qmap[s]
+                total_call_oi  += int(getattr(q, "open_interest", 0) or 0)
+                total_call_vol += int(getattr(q, "volume", 0) or 0)
+        for s in all_put_syms:
+            if s in qmap:
+                q = qmap[s]
+                total_put_oi  += int(getattr(q, "open_interest", 0) or 0)
+                total_put_vol += int(getattr(q, "volume", 0) or 0)
+
+        result["total_call_oi"]  = total_call_oi
+        result["total_put_oi"]   = total_put_oi
+        result["total_call_vol"] = total_call_vol
+        result["total_put_vol"]  = total_put_vol
+
+        # 5 عقود قريبة للعرض
+        nearby = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:5]
+        call_data, put_data = [], []
+        for c in nearby:
+            cs = _call_of(c)
+            ps = _put_of(c)
+            sk = int(_strike_of(c))
+            if cs and cs in qmap:
+                q = qmap[cs]
+                call_data.append({
+                    "strike": sk,
+                    "oi": int(getattr(q, "open_interest", 0) or 0),
+                    "volume": int(getattr(q, "volume", 0) or 0),
+                })
+            if ps and ps in qmap:
+                q = qmap[ps]
+                put_data.append({
+                    "strike": sk,
+                    "oi": int(getattr(q, "open_interest", 0) or 0),
+                    "volume": int(getattr(q, "volume", 0) or 0),
+                })
+
+        call_data.sort(key=lambda x: x["strike"], reverse=True)
+        put_data.sort(key=lambda x: x["strike"], reverse=True)
+        result["call_oi"] = call_data
+        result["put_oi"]  = put_data
+
+        # ============================================================
+        # 🐋 الحيتان — 10 عقود قريبة
+        # ============================================================
+        whales = []
+        wide = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:10]
+        for c in wide:
+            cs = _call_of(c)
+            ps = _put_of(c)
+            sk = int(_strike_of(c))
+            for sym_opt, opt_type_w in ((cs, "CALL"), (ps, "PUT")):
+                if not sym_opt or sym_opt not in qmap:
+                    continue
+                q = qmap[sym_opt]
+                vol = int(getattr(q, "volume", 0) or 0)
+                oi  = int(getattr(q, "open_interest", 0) or 0)
+                if vol < WHALE_MIN_VOLUME and oi < WHALE_MIN_OI:
+                    continue
+                bid = float(getattr(q, "bid", 0) or 0)
+                ask = float(getattr(q, "ask", 0) or 0)
+                last = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
+                dir_w = "mid"
+                if ask > bid > 0:
+                    spread = ask - bid
+                    pos = (last - bid) / spread if spread > 0 else 0.5
+                    if pos >= 0.7:   dir_w = "buy"
+                    elif pos <= 0.3: dir_w = "sell"
+                whales.append({
+                    "strike": sk, "type": opt_type_w,
+                    "volume": vol, "oi": oi,
+                    "bid": round(bid, 2),
+                    "ask": round(ask, 2),
+                    "last": round(last, 2),
+                    "direction": dir_w,
+                })
+        whales.sort(key=lambda w: w["volume"], reverse=True)
+        result["whales"] = whales[:5]
 
     except Exception:
         pass
@@ -444,17 +437,17 @@ def analyze_symbol(symbol: str) -> dict:
         "sweep": sweep, "ifvg": ifvg, "mss": mss,
         "call_oi": opt.get("call_oi", []),
         "put_oi": opt.get("put_oi", []),
-        "total_call_oi": opt.get("total_call_oi", 0),
-        "total_put_oi": opt.get("total_put_oi", 0),
+        "total_call_oi":  opt.get("total_call_oi", 0),
+        "total_put_oi":   opt.get("total_put_oi", 0),
         "total_call_vol": opt.get("total_call_vol", 0),
-        "total_put_vol": opt.get("total_put_vol", 0),
+        "total_put_vol":  opt.get("total_put_vol", 0),
         "whales": opt.get("whales", []),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
 # ============================================================
-# ✅ تعريف app أولاً
+# app — أولاً
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -494,7 +487,7 @@ app.add_middleware(
 
 
 # ============================================================
-# ✅ كل endpoints — الآن بعد تعريف app
+# endpoints
 # ============================================================
 @app.get("/api/status")
 def status(symbol: str = Query("AAPL")):
@@ -524,35 +517,29 @@ def analyze(symbol: str):
         })
 
 
-# ✅ endpoint خفيف لتحديث الشرائط والحيتان
+# ✅ endpoint خفيف — يستدعي fetch_option_data فقط (بدون تحليل كامل)
 @app.get("/api/options/{symbol}")
 def options_live(symbol: str):
     try:
         ctx = get_ctx()
         sym = norm(symbol)
-
         q = ctx.quote([sym])
         price = float(q[0].last_done) if q else 0.0
 
-        raw_dates = ctx.option_chain_expiry_date_list(sym)
-        if not raw_dates:
-            return JSONResponse(status_code=404, content={"error": "no dates"})
-
-        today = datetime.now(timezone.utc).date()
-        exp_date, dte = _parse_expiries(raw_dates, today, 37)
-        if not exp_date:
-            return JSONResponse(status_code=404, content={"error": "no future dates"})
-
-        chain, qmap = _fetch_full_chain(sym, exp_date)
-        if not chain:
-            return JSONResponse(status_code=404, content={"error": "no chain"})
-
-        payload = _build_options_payload(chain, qmap, price)
-        payload["expiry"] = exp_date.strftime("%b %d").upper()
-        payload["dte"] = dte
-        payload["price"] = round(price, 2)
-        return payload
-
+        # نستخدم "daily" لأننا نحتاج فقط OI/Vol — العقد الرئيسي لا يهم هنا
+        opt = fetch_option_data(symbol, "bullish", price, "daily")
+        return {
+            "expiry":         opt.get("expiry", "—"),
+            "dte":            opt.get("dte", "—"),
+            "price":          round(price, 2),
+            "call_oi":        opt.get("call_oi", []),
+            "put_oi":         opt.get("put_oi", []),
+            "total_call_oi":  opt.get("total_call_oi", 0),
+            "total_put_oi":   opt.get("total_put_oi", 0),
+            "total_call_vol": opt.get("total_call_vol", 0),
+            "total_put_vol":  opt.get("total_put_vol", 0),
+            "whales":         opt.get("whales", []),
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
