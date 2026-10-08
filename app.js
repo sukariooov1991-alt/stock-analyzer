@@ -1,10 +1,11 @@
 /* ============================================================
-   app.js — Final
+   app.js — Final + Live Options Update
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
 const reconnectTimers = new Map();
+const optionsTimers = new Map();
 let pollTimer = null;
 
 function saveCards() {
@@ -59,6 +60,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
+/* ===== OI Block ===== */
 function buildOIBlock(title, data, color) {
   if (!data || !data.length) {
     return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-empty">—</div></div>`;
@@ -73,6 +75,112 @@ function buildOIBlock(title, data, color) {
       </div>`;
   }).join("");
   return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
+}
+
+/* ===== whale row ===== */
+function buildWhaleRow(w) {
+  const dirLabel = w.direction === "buy" ? "🟢 يشتري"
+                 : w.direction === "sell" ? "🔴 يبيع"
+                 : "⚪ محايد";
+  const typeClass = w.type === "CALL" ? "whale-call" : "whale-put";
+  const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
+  const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
+  return `
+    <div class="whale-row ${typeClass}">
+      <div class="whale-strike">${w.type} ${w.strike}</div>
+      <div class="whale-vol">Vol: <b>${volFmt}</b></div>
+      <div class="whale-oi">OI: <b>${oiFmt}</b></div>
+      <div class="whale-dir">${dirLabel}</div>
+    </div>
+  `;
+}
+
+/* ===== المحتوى الموسّع (منفصل — يتحدث لحظياً) ===== */
+function buildExpandedInner(cardData) {
+  const tfs = cardData.timeframes || [];
+  const tfsHtml = tfs.map(t => `
+    <div class="tf-cell ${t.trend}">
+      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
+      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
+      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
+      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
+      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
+    </div>
+  `).join("");
+
+  const callOI = cardData.call_oi || [];
+  const putOI = cardData.put_oi || [];
+  const oiHtml = `
+    <div class="oi-grid">
+      ${buildOIBlock("PUT OI", putOI, "#8b5cf6")}
+      ${buildOIBlock("PUT LIQUIDITY", putOI.map(x => ({strike: x.strike, oi: x.volume})), "#ef4444")}
+      ${buildOIBlock("CALL OI", callOI, "#3b82f6")}
+      ${buildOIBlock("CALL LIQUIDITY", callOI.map(x => ({strike: x.strike, oi: x.volume})), "#22c55e")}
+    </div>
+  `;
+
+  const totalCallOI  = cardData.total_call_oi  || 0;
+  const totalPutOI   = cardData.total_put_oi   || 0;
+  const totalCallVol = cardData.total_call_vol || 0;
+  const totalPutVol  = cardData.total_put_vol  || 0;
+
+  const totalOI = totalCallOI + totalPutOI;
+  let putOIPct = 50, callOIPct = 50;
+  if (totalOI > 0) {
+    putOIPct = Math.round(totalPutOI / totalOI * 100);
+    callOIPct = 100 - putOIPct;
+  }
+
+  const totalVol = totalCallVol + totalPutVol;
+  let putVolPct = 50, callVolPct = 50;
+  if (totalVol > 0) {
+    putVolPct = Math.round(totalPutVol / totalVol * 100);
+    callVolPct = 100 - putVolPct;
+  }
+
+  const barHtml = `
+    <div class="putcall-wrapper">
+      <div class="putcall-label">Open Interest</div>
+      <div class="putcall-bar">
+        <span class="put">PUT ${putOIPct}%</span>
+        <div class="track"><div class="fill" style="width:${callOIPct}%"></div></div>
+        <span class="call">${callOIPct}% CALL</span>
+      </div>
+      <div class="putcall-label">Liquidity (Volume)</div>
+      <div class="putcall-bar">
+        <span class="put">PUT ${putVolPct}%</span>
+        <div class="track"><div class="fill" style="width:${callVolPct}%"></div></div>
+        <span class="call">${callVolPct}% CALL</span>
+      </div>
+    </div>
+  `;
+
+  const whales = cardData.whales || [];
+  let whaleHtml = "";
+  if (whales.length > 0) {
+    const rows = whales.map(buildWhaleRow).join("");
+    whaleHtml = `
+      <div class="whales-section">
+        <div class="whales-title">🐋 الحيتان المكتشفة</div>
+        <div class="whales-list">${rows}</div>
+      </div>
+    `;
+  }
+
+  const price = cardData.price ?? 0;
+  return `
+    <div class="tf-grid">${tfsHtml}</div>
+    ${oiHtml}
+    ${barHtml}
+    ${whaleHtml}
+    <div class="bottom-grid">
+      <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
+      <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
+    </div>
+    <div class="summary">${buildSummary(cardData)}</div>
+  `;
 }
 
 function buildCard(cardData) {
@@ -126,59 +234,8 @@ function buildCard(cardData) {
     </div>
   `;
 
-  const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => `
-    <div class="tf-cell ${t.trend}">
-      <div class="tf-label"><span>${t.label}</span><span>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
-      <div class="tf-row"><span>EMA</span><span class="v">${t.ema20}/${t.ema50}</span></div>
-      <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
-      <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
-      <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
-    </div>
-  `).join("");
-
-  const callOI = cardData.call_oi || [];
-  const putOI = cardData.put_oi || [];
-  const oiHtml = `
-    <div class="oi-grid">
-      ${buildOIBlock("PUT OI", putOI, "#8b5cf6")}
-      ${buildOIBlock("PUT LIQUIDITY", putOI.map(x => ({strike: x.strike, oi: x.volume})), "#ef4444")}
-      ${buildOIBlock("CALL OI", callOI, "#3b82f6")}
-      ${buildOIBlock("CALL LIQUIDITY", callOI.map(x => ({strike: x.strike, oi: x.volume})), "#22c55e")}
-    </div>
-  `;
-
-  /* ✅ الشريط من الإجمالي الحقيقي */
-  const totalCall = cardData.total_call_oi || 0;
-  const totalPut  = cardData.total_put_oi || 0;
-  const total = totalCall + totalPut;
-  let putPct = 50, callPct = 50;
-  if (total > 0) {
-    putPct = Math.round(totalPut / total * 100);
-    callPct = 100 - putPct;
-  }
-
-  const barHtml = `
-    <div class="putcall-bar">
-      <span class="put">PUT ${putPct}%</span>
-      <div class="track"><div class="fill" style="width:${callPct}%"></div></div>
-      <span class="call">${callPct}% CALL</span>
-    </div>
-  `;
-
   const expanded = `
-    <div class="card-expanded">
-      <div class="tf-grid">${tfsHtml}</div>
-      ${oiHtml}
-      ${barHtml}
-      <div class="bottom-grid">
-        <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
-        <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-        <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-        <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
-      </div>
-      <div class="summary">${buildSummary(cardData)}</div>
-    </div>
+    <div class="card-expanded">${buildExpandedInner(cardData)}</div>
   `;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
@@ -237,6 +294,7 @@ async function searchSymbol(symbol) {
     saveCards();
     renderCards();
     connectLive(symbol);
+    startOptionsPolling(symbol);
   } catch (e) {
     setConnection(false);
     alert("تعذّر الاتصال:\n" + e.message);
@@ -254,6 +312,10 @@ function deleteCard(symbol) {
     clearTimeout(reconnectTimers.get(symbol));
     reconnectTimers.delete(symbol);
   }
+  if (optionsTimers.has(symbol)) {
+    clearInterval(optionsTimers.get(symbol));
+    optionsTimers.delete(symbol);
+  }
 }
 
 function updateCardPrice(symbol, price) {
@@ -263,7 +325,48 @@ function updateCardPrice(symbol, price) {
     card.price = price;
     const el = cardsArea.querySelector(`[data-symbol="${symbol}"] .price-cell .val`);
     if (el) el.textContent = "$" + parseFloat(price).toFixed(2);
+    // حدّث السعر في bottom-grid
+    const elBottom = cardsArea.querySelector(`[data-symbol="${symbol}"] .bottom-grid .cell:last-child .val`);
+    if (elBottom) elBottom.textContent = "$" + parseFloat(price).toFixed(2);
   }
+}
+
+/* ✅ تحديث الشرائط والحيتان — كل 30 ثانية */
+function updateCardOptions(symbol, opt) {
+  const card = cards.find(c => c.symbol === symbol);
+  if (!card) return;
+
+  if (opt.total_call_oi  != null) card.total_call_oi  = opt.total_call_oi;
+  if (opt.total_put_oi   != null) card.total_put_oi   = opt.total_put_oi;
+  if (opt.total_call_vol != null) card.total_call_vol = opt.total_call_vol;
+  if (opt.total_put_vol  != null) card.total_put_vol  = opt.total_put_vol;
+  if (opt.call_oi)  card.call_oi = opt.call_oi;
+  if (opt.put_oi)   card.put_oi  = opt.put_oi;
+  if (opt.whales)   card.whales  = opt.whales;
+
+  const expanded = cardsArea.querySelector(`[data-symbol="${symbol}"] .card-expanded`);
+  if (expanded) {
+    expanded.innerHTML = buildExpandedInner(card);
+  }
+}
+
+async function fetchCardOptions(symbol) {
+  try {
+    const r = await fetch(`${API_BASE}/api/options/${symbol}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    updateCardOptions(symbol, d);
+  } catch (e) {}
+}
+
+function startOptionsPolling(symbol) {
+  if (optionsTimers.has(symbol)) {
+    clearInterval(optionsTimers.get(symbol));
+  }
+  // أول تحديث بعد 10 ثواني، ثم كل 30
+  setTimeout(() => fetchCardOptions(symbol), 10000);
+  const timer = setInterval(() => fetchCardOptions(symbol), 30000);
+  optionsTimers.set(symbol, timer);
 }
 
 function connectLive(symbol) {
@@ -302,7 +405,7 @@ function connectLive(symbol) {
   socketMap.set(symbol, ws);
 }
 
-/* ✅ Polling كل 5 ثواني — يعمل حتى لو WebSocket ما اشتغل */
+/* Polling السعر كل 5 ثواني */
 async function pollPrices() {
   for (const card of cards) {
     try {
@@ -326,9 +429,12 @@ searchForm.addEventListener("submit", (e) => {
 (function init() {
   cards = loadCards();
   renderCards();
-  cards.forEach(c => connectLive(c.symbol));
+  cards.forEach(c => {
+    connectLive(c.symbol);
+    startOptionsPolling(c.symbol);
+  });
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
   setTimeout(pollPrices, 3000);
-  pollTimer = setInterval(pollPrices, 5000);  // ✅ كل 5 ثواني
+  pollTimer = setInterval(pollPrices, 5000);
 })();
