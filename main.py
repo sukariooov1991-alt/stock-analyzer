@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-النسخة النهائية — إصلاحات WebSocket + السعر اللحظي
+مع تحديث لحظي للشرائط والحيتان
 """
 import os
 import asyncio
@@ -31,6 +31,9 @@ _lb_config = Config.from_apikey_env()
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 _subscribed: set[str] = set()
+
+WHALE_MIN_VOLUME = 3000
+WHALE_MIN_OI     = 5000
 
 
 def get_ctx() -> QuoteContext:
@@ -79,7 +82,172 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# fetch_option_data
+# دوال مشتركة للأوبشن
+# ============================================================
+def _get_strike(c):
+    for attr in ("strike_price", "strike", "price"):
+        v = getattr(c, attr, None)
+        if v is not None:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return 0.0
+
+
+def _get_call_symbol(c):
+    v = getattr(c, "call_symbol", None)
+    if v: return v
+    co = getattr(c, "call", None)
+    if co is not None:
+        return getattr(co, "symbol", None)
+    return None
+
+
+def _get_put_symbol(c):
+    v = getattr(c, "put_symbol", None)
+    if v: return v
+    po = getattr(c, "put", None)
+    if po is not None:
+        return getattr(po, "symbol", None)
+    return None
+
+
+def _parse_expiries(raw_dates, today, target_dte):
+    parsed = []
+    for d in raw_dates:
+        if isinstance(d, date_cls):
+            if d > today:
+                parsed.append(d)
+        elif isinstance(d, str):
+            try:
+                dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
+                if dd > today:
+                    parsed.append(dd)
+            except Exception:
+                continue
+    if not parsed:
+        return None, None
+    return min([(d, (d - today).days) for d in parsed], key=lambda x: abs(x[1] - target_dte))
+
+
+def _build_options_payload(chain, qmap, price):
+    """يبني OI/Volume/Whales من السلسلة"""
+    all_call_syms, all_put_syms = [], []
+    for c in chain:
+        cs = _get_call_symbol(c)
+        ps = _get_put_symbol(c)
+        if cs: all_call_syms.append(cs)
+        if ps: all_put_syms.append(ps)
+
+    total_call_oi = total_put_oi = total_call_vol = total_put_vol = 0
+    for s in all_call_syms:
+        if s in qmap:
+            q = qmap[s]
+            total_call_oi  += int(getattr(q, "open_interest", 0) or 0)
+            total_call_vol += int(getattr(q, "volume", 0) or 0)
+    for s in all_put_syms:
+        if s in qmap:
+            q = qmap[s]
+            total_put_oi  += int(getattr(q, "open_interest", 0) or 0)
+            total_put_vol += int(getattr(q, "volume", 0) or 0)
+
+    nearby = sorted(chain, key=lambda c: abs(_get_strike(c) - price))[:5]
+    call_data, put_data = [], []
+    for c in nearby:
+        cs = _get_call_symbol(c)
+        ps = _get_put_symbol(c)
+        sk = int(_get_strike(c))
+        if cs and cs in qmap:
+            q = qmap[cs]
+            call_data.append({
+                "strike": sk,
+                "oi": int(getattr(q, "open_interest", 0) or 0),
+                "volume": int(getattr(q, "volume", 0) or 0),
+            })
+        if ps and ps in qmap:
+            q = qmap[ps]
+            put_data.append({
+                "strike": sk,
+                "oi": int(getattr(q, "open_interest", 0) or 0),
+                "volume": int(getattr(q, "volume", 0) or 0),
+            })
+    call_data.sort(key=lambda x: x["strike"], reverse=True)
+    put_data.sort(key=lambda x: x["strike"], reverse=True)
+
+    # الحيتان
+    whales = []
+    wide = sorted(chain, key=lambda c: abs(_get_strike(c) - price))[:10]
+    for c in wide:
+        cs = _get_call_symbol(c)
+        ps = _get_put_symbol(c)
+        sk = int(_get_strike(c))
+        for sym_opt, opt_type in ((cs, "CALL"), (ps, "PUT")):
+            if not sym_opt or sym_opt not in qmap:
+                continue
+            q = qmap[sym_opt]
+            vol = int(getattr(q, "volume", 0) or 0)
+            oi  = int(getattr(q, "open_interest", 0) or 0)
+            if vol < WHALE_MIN_VOLUME and oi < WHALE_MIN_OI:
+                continue
+            bid = float(getattr(q, "bid", 0) or 0)
+            ask = float(getattr(q, "ask", 0) or 0)
+            last = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
+            direction_w = "mid"
+            if ask > bid > 0:
+                spread = ask - bid
+                pos = (last - bid) / spread if spread > 0 else 0.5
+                if pos >= 0.7:   direction_w = "buy"
+                elif pos <= 0.3: direction_w = "sell"
+            whales.append({
+                "strike": sk, "type": opt_type,
+                "volume": vol, "oi": oi,
+                "bid": round(bid, 2), "ask": round(ask, 2), "last": round(last, 2),
+                "direction": direction_w,
+            })
+    whales.sort(key=lambda w: w["volume"], reverse=True)
+
+    return {
+        "call_oi": call_data,
+        "put_oi": put_data,
+        "total_call_oi": total_call_oi,
+        "total_put_oi": total_put_oi,
+        "total_call_vol": total_call_vol,
+        "total_put_vol": total_put_vol,
+        "whales": whales[:5],
+    }
+
+
+def _fetch_full_chain(sym, exp_date):
+    """يجلب السلسلة ويجمع كل الـ quotes"""
+    ctx = get_ctx()
+    chain = ctx.option_chain_info_by_date(sym, exp_date)
+    if not chain:
+        return None, {}
+
+    all_syms = []
+    for c in chain:
+        cs = _get_call_symbol(c)
+        ps = _get_put_symbol(c)
+        if cs: all_syms.append(cs)
+        if ps: all_syms.append(ps)
+
+    qmap = {}
+    BATCH = 100
+    for i in range(0, len(all_syms), BATCH):
+        batch = all_syms[i:i + BATCH]
+        try:
+            qs = ctx.option_quote(batch)
+            if qs:
+                for q in qs:
+                    qmap[q.symbol] = q
+        except Exception:
+            pass
+    return chain, qmap
+
+
+# ============================================================
+# fetch_option_data — النسخة الكاملة (للتحليل الأولي)
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
@@ -89,8 +257,9 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         "strike": "—", "expiry": "—", "dte": "—", "premium": "—",
         "delta": None,
         "call_oi": [], "put_oi": [],
-        "total_call_oi": 0,
-        "total_put_oi": 0,
+        "total_call_oi": 0, "total_put_oi": 0,
+        "total_call_vol": 0, "total_put_vol": 0,
+        "whales": [],
     }
 
     try:
@@ -100,75 +269,33 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
 
         today = datetime.now(timezone.utc).date()
         target_dte = 37 if strategy == "daily" else 52
-
-        parsed_dates = []
-        for d in raw_dates:
-            if isinstance(d, date_cls):
-                if d > today:
-                    parsed_dates.append(d)
-            elif isinstance(d, str):
-                try:
-                    dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
-                    if dd > today:
-                        parsed_dates.append(dd)
-                except Exception:
-                    continue
-
-        if not parsed_dates:
+        exp_date, dte = _parse_expiries(raw_dates, today, target_dte)
+        if not exp_date:
             return result
 
-        exp_date, dte = min(
-            [(d, (d - today).days) for d in parsed_dates],
-            key=lambda x: abs(x[1] - target_dte)
-        )
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
-        chain = ctx.option_chain_info_by_date(sym, exp_date)
+        chain, qmap = _fetch_full_chain(sym, exp_date)
         if not chain:
             return result
 
-        def get_strike(c):
-            for attr in ("strike_price", "strike", "price"):
-                v = getattr(c, attr, None)
-                if v is not None:
-                    try:
-                        return float(v)
-                    except Exception:
-                        pass
-            return 0.0
-
-        def get_call_symbol(c):
-            v = getattr(c, "call_symbol", None)
-            if v: return v
-            co = getattr(c, "call", None)
-            if co is not None:
-                return getattr(co, "symbol", None)
-            return None
-
-        def get_put_symbol(c):
-            v = getattr(c, "put_symbol", None)
-            if v: return v
-            po = getattr(c, "put", None)
-            if po is not None:
-                return getattr(po, "symbol", None)
-            return None
-
+        # اختيار العقد الرئيسي
         if direction == "bullish":
             target = price * 1.015
-            cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
+            cands = [c for c in chain if _get_call_symbol(c) and _get_strike(c) > price]
             if not cands: return result
-            best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = get_call_symbol(best)
-            strike = get_strike(best)
+            best = min(cands, key=lambda c: abs(_get_strike(c) - target))
+            option_symbol = _get_call_symbol(best)
+            strike = _get_strike(best)
             opt_type = "C"
         else:
             target = price * 0.985
-            cands = [c for c in chain if get_put_symbol(c) and get_strike(c) < price]
+            cands = [c for c in chain if _get_put_symbol(c) and _get_strike(c) < price]
             if not cands: return result
-            best = min(cands, key=lambda c: abs(get_strike(c) - target))
-            option_symbol = get_put_symbol(best)
-            strike = get_strike(best)
+            best = min(cands, key=lambda c: abs(_get_strike(c) - target))
+            option_symbol = _get_put_symbol(best)
+            strike = _get_strike(best)
             opt_type = "P"
 
         result["strike"] = f"{opt_type} {int(strike)}"
@@ -187,68 +314,49 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         except Exception:
             pass
 
-        # جمع OI لكامل السلسلة
-        all_call_syms, all_put_syms = [], []
-        for c in chain:
-            cs = get_call_symbol(c)
-            ps = get_put_symbol(c)
-            if cs: all_call_syms.append(cs)
-            if ps: all_put_syms.append(ps)
-
-        qmap = {}
-        all_syms = all_call_syms + all_put_syms
-        BATCH = 100
-        for i in range(0, len(all_syms), BATCH):
-            batch = all_syms[i:i + BATCH]
-            try:
-                qs = ctx.option_quote(batch)
-                if qs:
-                    for q in qs:
-                        qmap[q.symbol] = q
-            except Exception:
-                pass
-
-        total_call_oi, total_put_oi = 0, 0
-        for s in all_call_syms:
-            if s in qmap:
-                total_call_oi += int(getattr(qmap[s], "open_interest", 0) or 0)
-        for s in all_put_syms:
-            if s in qmap:
-                total_put_oi += int(getattr(qmap[s], "open_interest", 0) or 0)
-
-        result["total_call_oi"] = total_call_oi
-        result["total_put_oi"] = total_put_oi
-
-        # OI للعرض
-        nearby = sorted(chain, key=lambda c: abs(get_strike(c) - price))[:5]
-        call_data, put_data = [], []
-        for c in nearby:
-            cs = get_call_symbol(c)
-            ps = get_put_symbol(c)
-            if cs and cs in qmap:
-                q = qmap[cs]
-                call_data.append({
-                    "strike": int(get_strike(c)),
-                    "oi": int(getattr(q, "open_interest", 0) or 0),
-                    "volume": int(getattr(q, "volume", 0) or 0),
-                })
-            if ps and ps in qmap:
-                q = qmap[ps]
-                put_data.append({
-                    "strike": int(get_strike(c)),
-                    "oi": int(getattr(q, "open_interest", 0) or 0),
-                    "volume": int(getattr(q, "volume", 0) or 0),
-                })
-
-        call_data.sort(key=lambda x: x["strike"], reverse=True)
-        put_data.sort(key=lambda x: x["strike"], reverse=True)
-        result["call_oi"] = call_data
-        result["put_oi"] = put_data
+        payload = _build_options_payload(chain, qmap, price)
+        result.update(payload)
 
     except Exception:
         pass
 
     return result
+
+
+# ============================================================
+# ✅ endpoint خفيف للتحديث اللحظي
+# ============================================================
+@app.get("/api/options/{symbol}")
+def options_live(symbol: str):
+    """يُرجع فقط OI/Volume/Whales — لتحديث البطاقة كل 30 ثانية"""
+    try:
+        ctx = get_ctx()
+        sym = norm(symbol)
+
+        q = ctx.quote([sym])
+        price = float(q[0].last_done) if q else 0.0
+
+        raw_dates = ctx.option_chain_expiry_date_list(sym)
+        if not raw_dates:
+            return JSONResponse(status_code=404, content={"error": "no dates"})
+
+        today = datetime.now(timezone.utc).date()
+        exp_date, dte = _parse_expiries(raw_dates, today, 37)
+        if not exp_date:
+            return JSONResponse(status_code=404, content={"error": "no future dates"})
+
+        chain, qmap = _fetch_full_chain(sym, exp_date)
+        if not chain:
+            return JSONResponse(status_code=404, content={"error": "no chain"})
+
+        payload = _build_options_payload(chain, qmap, price)
+        payload["expiry"] = exp_date.strftime("%b %d").upper()
+        payload["dte"] = dte
+        payload["price"] = round(price, 2)
+        return payload
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 def compute_levels(entry, sweep_level, ifvg_bottom, htf_target, atr_val, direction="bullish"):
@@ -380,6 +488,9 @@ def analyze_symbol(symbol: str) -> dict:
         "put_oi": opt.get("put_oi", []),
         "total_call_oi": opt.get("total_call_oi", 0),
         "total_put_oi": opt.get("total_put_oi", 0),
+        "total_call_vol": opt.get("total_call_vol", 0),
+        "total_put_vol": opt.get("total_put_vol", 0),
+        "whales": opt.get("whales", []),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -449,14 +560,12 @@ def analyze(symbol: str):
         })
 
 
-# ✅ السعر اللحظي — من شمعة Min_1 (تشمل كل الجلسات)
 @app.get("/api/price/{symbol}")
 def price_only(symbol: str):
     try:
         ctx = get_ctx()
         sym = norm(symbol)
 
-        # محاولة 1: آخر شمعة Min_1
         try:
             candles = ctx.candlesticks(
                 sym, Period.Min_1, 1,
@@ -477,7 +586,6 @@ def price_only(symbol: str):
         except Exception:
             pass
 
-        # محاولة 2: quote()
         q = ctx.quote([sym])
         if q:
             return {
@@ -518,7 +626,6 @@ manager = ConnectionManager()
 
 
 def _on_quote(symbol: str, event: PushQuote):
-    print(f"[PUSH] {symbol} {event.last_done}", flush=True)
     global _event_loop
     if _event_loop is None:
         return
@@ -544,12 +651,10 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     if sym_us not in _subscribed:
         try:
             ctx = get_ctx()
-            # ✅ بدون is_first_push (غير مدعوم في SDK 4.5.0)
             ctx.subscribe([sym_us], [SubType.Quote])
             _subscribed.add(sym_us)
-            print(f"[WS] subscribed {sym_us}", flush=True)
-        except Exception as e:
-            print(f"[WS] error {type(e).__name__}: {e}", flush=True)
+        except Exception:
+            pass
 
     try:
         while True:
