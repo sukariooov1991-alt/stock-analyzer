@@ -1,6 +1,6 @@
 """
 main.py — FastAPI + WebSocket + Longbridge
-السعر اللحظي + حساب OI الكامل للسلسلة
+النسخة النهائية — إصلاحات WebSocket + السعر اللحظي
 """
 import os
 import asyncio
@@ -79,7 +79,7 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# fetch_option_data — مع جمع OI الكامل للسلسلة
+# fetch_option_data
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
@@ -94,7 +94,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
     }
 
     try:
-        # 1) تواريخ الانتهاء
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         if not raw_dates:
             return result
@@ -125,7 +124,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
-        # 2) سلسلة العقود الكاملة
         chain = ctx.option_chain_info_by_date(sym, exp_date)
         if not chain:
             return result
@@ -156,7 +154,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
                 return getattr(po, "symbol", None)
             return None
 
-        # 3) اختيار العقد الرئيسي
         if direction == "bullish":
             target = price * 1.015
             cands = [c for c in chain if get_call_symbol(c) and get_strike(c) > price]
@@ -176,7 +173,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # 4) سعر العقد الرئيسي
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -191,28 +187,15 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         except Exception:
             pass
 
-        # ===== 5) حساب OI الإجمالي للسلسلة كاملة =====
-        # نجمع كل العقود (Call + Put) — لكن نحتاج نقسم لدفعات لأن حد Longbridge ~500 رمز
-        all_call_syms = []
-        all_put_syms = []
-        strike_map = {}  # symbol → strike
-
+        # جمع OI لكامل السلسلة
+        all_call_syms, all_put_syms = [], []
         for c in chain:
             cs = get_call_symbol(c)
             ps = get_put_symbol(c)
-            sk = get_strike(c)
-            if cs:
-                all_call_syms.append(cs)
-                strike_map[cs] = sk
-            if ps:
-                all_put_syms.append(ps)
-                strike_map[ps] = sk
+            if cs: all_call_syms.append(cs)
+            if ps: all_put_syms.append(ps)
 
-        # ✅ جمع OI من كل العقود (بدفعات 100 لتجنب الحد)
-        total_call_oi = 0
-        total_put_oi = 0
         qmap = {}
-
         all_syms = all_call_syms + all_put_syms
         BATCH = 100
         for i in range(0, len(all_syms), BATCH):
@@ -225,7 +208,7 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
             except Exception:
                 pass
 
-        # جمع OI
+        total_call_oi, total_put_oi = 0, 0
         for s in all_call_syms:
             if s in qmap:
                 total_call_oi += int(getattr(qmap[s], "open_interest", 0) or 0)
@@ -236,9 +219,8 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         result["total_call_oi"] = total_call_oi
         result["total_put_oi"] = total_put_oi
 
-        # ===== 6) OI للعقود القريبة (للعرض) =====
+        # OI للعرض
         nearby = sorted(chain, key=lambda c: abs(get_strike(c) - price))[:5]
-
         call_data, put_data = [], []
         for c in nearby:
             cs = get_call_symbol(c)
@@ -467,11 +449,36 @@ def analyze(symbol: str):
         })
 
 
+# ✅ السعر اللحظي — من شمعة Min_1 (تشمل كل الجلسات)
 @app.get("/api/price/{symbol}")
 def price_only(symbol: str):
     try:
         ctx = get_ctx()
-        q = ctx.quote([norm(symbol)])
+        sym = norm(symbol)
+
+        # محاولة 1: آخر شمعة Min_1
+        try:
+            candles = ctx.candlesticks(
+                sym, Period.Min_1, 1,
+                AdjustType.NoAdjust,
+                trade_sessions=TradeSessions.All,
+            )
+            if candles:
+                last = candles[-1]
+                return {
+                    "symbol": symbol.upper(),
+                    "price": float(last.close),
+                    "open": float(last.open),
+                    "high": float(last.high),
+                    "low": float(last.low),
+                    "volume": int(last.volume),
+                    "timestamp": last.timestamp.isoformat(),
+                }
+        except Exception:
+            pass
+
+        # محاولة 2: quote()
+        q = ctx.quote([sym])
         if q:
             return {
                 "symbol": symbol.upper(),
@@ -537,7 +544,8 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     if sym_us not in _subscribed:
         try:
             ctx = get_ctx()
-            ctx.subscribe([sym_us], [SubType.Quote], is_first_push=True)
+            # ✅ بدون is_first_push (غير مدعوم في SDK 4.5.0)
+            ctx.subscribe([sym_us], [SubType.Quote])
             _subscribed.add(sym_us)
             print(f"[WS] subscribed {sym_us}", flush=True)
         except Exception as e:
