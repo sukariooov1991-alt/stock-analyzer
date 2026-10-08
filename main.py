@@ -29,16 +29,11 @@ from analysis import (
 # ============================================================
 # الإعدادات
 # ============================================================
-LB_KEY    = os.environ.get("LONGBRIDGE_APP_KEY", "")
-LB_SECRET = os.environ.get("LONGBRIDGE_APP_SECRET", "")
-LB_TOKEN  = os.environ.get("LONGBRIDGE_ACCESS_TOKEN", "")
-PORT      = int(os.environ.get("PORT", 10000))
+PORT = int(os.environ.get("PORT", 10000))
 
-_lb_config = Config(
-    app_key=LB_KEY,
-    app_secret=LB_SECRET,
-    access_token=LB_TOKEN,
-)
+# ✅ الطريقة الصحيحة في longbridge 4.x — تقرأ المتغيرات تلقائياً من البيئة
+# LONGBRIDGE_APP_KEY / LONGBRIDGE_APP_SECRET / LONGBRIDGE_ACCESS_TOKEN
+_lb_config = Config.from_apikey_env()
 
 _quote_ctx: QuoteContext | None = None
 
