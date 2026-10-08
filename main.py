@@ -6,10 +6,11 @@ FastAPI + WebSocket + Longbridge
 import os
 import json
 import asyncio
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 
@@ -31,17 +32,21 @@ from analysis import (
 # ============================================================
 PORT = int(os.environ.get("PORT", 10000))
 
-# ✅ الطريقة الصحيحة في longbridge 4.x — تقرأ المتغيرات تلقائياً من البيئة
-# LONGBRIDGE_APP_KEY / LONGBRIDGE_APP_SECRET / LONGBRIDGE_ACCESS_TOKEN
 _lb_config = Config.from_apikey_env()
 
 _quote_ctx: QuoteContext | None = None
+_last_error: str | None = None
 
 
 def get_ctx() -> QuoteContext:
-    global _quote_ctx
+    global _quote_ctx, _last_error
     if _quote_ctx is None:
-        _quote_ctx = QuoteContext(_lb_config)
+        try:
+            _quote_ctx = QuoteContext(_lb_config)
+            _last_error = None
+        except Exception as e:
+            _last_error = f"{type(e).__name__}: {e}"
+            raise
     return _quote_ctx
 
 
@@ -105,14 +110,15 @@ def analyze_symbol(symbol: str) -> dict:
 
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
+    prev_close = float(q.prev_close)
 
     trend_1d = df_1d["close"].iloc[-1] > df_1d["ema50"].iloc[-1]
     use_daily = trend_1d
 
     if use_daily:
-        htf_df, exec_df, exec_tf = df_1d, df_15m, "15m"
+        htf_df, exec_df = df_1d, df_15m
     else:
-        htf_df, exec_df, exec_tf = df_4h, df_1h, "1h"
+        htf_df, exec_df = df_4h, df_1h
 
     prev = htf_df.iloc[-2]
     prev_low  = float(prev["low"])
@@ -192,8 +198,8 @@ def analyze_symbol(symbol: str) -> dict:
     return {
         "symbol":  symbol.upper(),
         "price":   round(price, 2),
-        "change":  round(price - float(q.prev_close), 2),
-        "changePercent": round((price - float(q.prev_close)) / float(q.prev_close) * 100, 2),
+        "change":  round(price - prev_close, 2),
+        "changePercent": round((price - prev_close) / prev_close * 100, 2) if prev_close else 0,
         "card":    card,
         "levels":  levels,
         "timeframes": timeframes,
@@ -209,7 +215,10 @@ def analyze_symbol(symbol: str) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    get_ctx()
+    try:
+        get_ctx()
+    except Exception:
+        pass
     yield
     global _quote_ctx
     _quote_ctx = None
@@ -226,8 +235,33 @@ app.add_middleware(
 
 
 # ============================================================
-# API
+# نقاط الفحص
 # ============================================================
+@app.get("/api/status")
+def status():
+    """فحص الاتصال الفعلي بـ Longbridge"""
+    try:
+        ctx = get_ctx()
+        q = ctx.quote(["AAPL.US"])
+        if q:
+            return {
+                "connected": True,
+                "price":     str(q[0].last_done),
+                "symbol":    q[0].symbol,
+            }
+        return {"connected": False, "error": "لا توجد بيانات"}
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "connected": False,
+                "error": str(e),
+                "type": type(e).__name__,
+                "traceback": traceback.format_exc().split("\n")[-8:],
+            },
+        )
+
+
 @app.get("/api/health")
 def health():
     return {"status": "healthy"}
@@ -238,7 +272,14 @@ def analyze(symbol: str):
     try:
         return analyze_symbol(symbol)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": str(e),
+                "type": type(e).__name__,
+                "traceback": traceback.format_exc().split("\n")[-10:],
+            },
+        )
 
 
 # ============================================================
@@ -270,13 +311,8 @@ _subscribed: set[str] = set()
 
 def _on_quote(symbol: str, event: PushQuote):
     msg = {
-        "symbol":   symbol.replace(".US", ""),
-        "price":    float(event.last_done),
-        "open":     float(event.open),
-        "high":     float(event.high),
-        "low":      float(event.low),
-        "volume":   int(event.volume),
-        "timestamp": event.timestamp.isoformat(),
+        "symbol": symbol.replace(".US", ""),
+        "price":  float(event.last_done),
     }
     try:
         loop = asyncio.get_event_loop()
@@ -289,14 +325,15 @@ def _on_quote(symbol: str, event: PushQuote):
 async def ws_endpoint(ws: WebSocket, symbol: str):
     symbol = symbol.upper()
     await manager.connect(symbol, ws)
-
     sym_us = norm(symbol)
     if sym_us not in _subscribed:
-        ctx = get_ctx()
-        ctx.set_on_quote(_on_quote)
-        ctx.subscribe([sym_us], [SubType.Quote], is_first_push=True)
-        _subscribed.add(sym_us)
-
+        try:
+            ctx = get_ctx()
+            ctx.set_on_quote(_on_quote)
+            ctx.subscribe([sym_us], [SubType.Quote], is_first_push=True)
+            _subscribed.add(sym_us)
+        except Exception:
+            pass
     try:
         while True:
             await ws.receive_text()
@@ -305,7 +342,7 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
 
 
 # ============================================================
-# الواجهة (HTML/CSS/JS)
+# الواجهة
 # ============================================================
 @app.get("/")
 def index():
