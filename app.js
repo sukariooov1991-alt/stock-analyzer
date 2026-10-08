@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final
+   app.js — مع تنبيه صوتي
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -7,6 +7,9 @@ const socketMap = new Map();
 const reconnectTimers = new Map();
 const optionsTimers = new Map();
 let pollTimer = null;
+
+// ✅ حالة آخر إشارة صوتية (لمنع تكرار الصوت)
+const lastAlertedState = {}; // { symbol: "green" | "red" | "yellow" | "gray" }
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -24,6 +27,45 @@ const themeBtn = document.getElementById("themeBtn");
 const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
+
+/* ✅ تشغيل الصوت */
+function playAlertSound(type) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const now = ctx.currentTime;
+
+    // نوتتين — CALL نغمة صاعدة، PUT نغمة هابطة
+    const notes = type === "green" ? [523.25, 783.99] : [783.99, 523.25];
+
+    notes.forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      const start = now + i * 0.2;
+      gain.gain.setValueAtTime(0.3, start);
+      gain.gain.exponentialRampToValueAtTime(0.01, start + 0.25);
+      osc.start(start);
+      osc.stop(start + 0.3);
+    });
+  } catch (e) {
+    console.warn("Audio error:", e);
+  }
+}
+
+/* ✅ فحص الإشارة وإطلاق الصوت إن كانت جديدة */
+function checkAlert(symbol, color) {
+  const prev = lastAlertedState[symbol];
+  if (color === "green" || color === "red") {
+    if (prev !== color) {
+      playAlertSound(color);
+      console.log(`[ALERT] ${symbol} → ${color}`);
+    }
+  }
+  lastAlertedState[symbol] = color;
+}
 
 function applyTheme(light) {
   document.body.classList.toggle("light", light);
@@ -60,7 +102,6 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -70,12 +111,7 @@ function buildOIBlockStatic(title, kind, color) {
         <div class="oi-strike" data-oi-strike="${kind}-${i}">—</div>
       </div>`;
   }
-  return `
-    <div class="oi-box">
-      <div class="oi-title">${title}</div>
-      <div class="oi-rows">${rows}</div>
-    </div>
-  `;
+  return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
 }
 
 function updateOIBlockData(root, kind, data) {
@@ -97,7 +133,6 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== الحيتان ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -109,41 +144,30 @@ function buildWhalesStatic(sym) {
         <div class="whale-dir" data-whale-dir="${sym}-${i}">—</div>
       </div>`;
   }
-  return `
-    <div class="whales-section" id="whales-${sym}" style="display:none;">
-      <div class="whales-title">🐋 الحيتان المكتشفة</div>
-      <div class="whales-list">${rows}</div>
-    </div>
-  `;
+  return `<div class="whales-section" id="whales-${sym}" style="display:none;">
+    <div class="whales-title">🐋 الحيتان المكتشفة</div>
+    <div class="whales-list">${rows}</div>
+  </div>`;
 }
 
 function updateWhalesData(root, sym, whales) {
   if (!root) return;
   const wrap = root.querySelector(`#whales-${sym}`);
   if (!wrap) return;
-
   whales = whales || [];
-
-  if (whales.length === 0) {
-    wrap.style.display = "none";
-    return;
-  }
+  if (whales.length === 0) { wrap.style.display = "none"; return; }
   wrap.style.display = "block";
-
   for (let i = 0; i < 5; i++) {
     const row = root.querySelector(`[data-whale-row="${sym}-${i}"]`);
     if (!row) continue;
-
     if (i < whales.length) {
       const w = whales[i];
       row.style.display = "grid";
       row.className = "whale-row " + (w.type === "CALL" ? "whale-call" : "whale-put");
-
       const strike = row.querySelector(`[data-whale-strike="${sym}-${i}"]`);
       const vol = row.querySelector(`[data-whale-vol="${sym}-${i}"]`);
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
-
       if (strike) strike.textContent = `${w.type} ${w.strike}`;
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
       const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
@@ -158,14 +182,9 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ============================================================
-   ✅ الشرائط — تُحسب من المصفوفة نفسها
-   ============================================================ */
 function updatePutCallBars(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
-
-  // ✅ احسب من المصفوفات — نفس البيانات التي تُستخدم في البطاقات
   const totalCallOI  = callOI.reduce((s, x) => s + (x.oi || 0), 0);
   const totalPutOI   = putOI.reduce((s, x) => s + (x.oi || 0), 0);
   const totalCallVol = callOI.reduce((s, x) => s + (x.volume || 0), 0);
@@ -177,7 +196,6 @@ function updatePutCallBars(root, sym, card) {
     putOIPct = Math.round(totalPutOI / totalOI * 100);
     callOIPct = 100 - putOIPct;
   }
-
   const totalVol = totalCallVol + totalPutVol;
   let putVolPct = 50, callVolPct = 50;
   if (totalVol > 0) {
@@ -204,12 +222,10 @@ function updateAllDynamic(root, sym, card) {
   if (!root || !card) return;
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
-
   updateOIBlockData(root, "put-oi",   putOI);
   updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
   updateOIBlockData(root, "call-oi",  callOI);
   updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-
   updatePutCallBars(root, sym, card);
   updateWhalesData(root, sym, card.whales || []);
 }
@@ -220,6 +236,9 @@ function buildCard(cardData) {
   const cls = c.color || "gray";
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
+
+  // ✅ تشغيل الصوت عند إشارة جديدة
+  checkAlert(sym, cls);
 
   const div = document.createElement("div");
   div.className = "card " + cls;
@@ -245,8 +264,7 @@ function buildCard(cardData) {
           </svg>
         </button>
       </div>
-    </div>
-  `;
+    </div>`;
 
   const row2 = `
     <div class="card-row row-2">
@@ -254,8 +272,7 @@ function buildCard(cardData) {
       <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
       <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
       <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
-    </div>
-  `;
+    </div>`;
 
   const row3 = `
     <div class="card-row row-3">
@@ -263,8 +280,7 @@ function buildCard(cardData) {
       <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
       <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
       <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
-    </div>
-  `;
+    </div>`;
 
   const tfs = cardData.timeframes || [];
   const tfsHtml = tfs.map(t => `
@@ -274,8 +290,7 @@ function buildCard(cardData) {
       <div class="tf-row"><span>RSI</span><span class="v">${t.rsi}</span></div>
       <div class="tf-row"><span>ADX</span><span class="v">${t.adx}</span></div>
       <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
-    </div>
-  `).join("");
+    </div>`).join("");
 
   const oiHtml = `
     <div class="oi-grid">
@@ -283,8 +298,7 @@ function buildCard(cardData) {
       ${buildOIBlockStatic("PUT LIQUIDITY", "put-liq", "#ef4444")}
       ${buildOIBlockStatic("CALL OI", "call-oi", "#3b82f6")}
       ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
-    </div>
-  `;
+    </div>`;
 
   const barHtml = `
     <div class="putcall-wrapper">
@@ -300,8 +314,7 @@ function buildCard(cardData) {
         <div class="track"><div class="fill" id="call-vol-fill-${sym}" style="width:50%"></div></div>
         <span class="call" id="call-vol-pct-${sym}">50% CALL</span>
       </div>
-    </div>
-  `;
+    </div>`;
 
   const whalesHtml = buildWhalesStatic(sym);
 
@@ -318,11 +331,9 @@ function buildCard(cardData) {
         <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
       </div>
       <div class="summary">${buildSummary(cardData)}</div>
-    </div>
-  `;
+    </div>`;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
-
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
@@ -415,17 +426,12 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ التحديث — يحمي كل قيمة من الاستبدال الفارغ */
 function updateCardOptions(symbol, opt) {
   const card = cards.find(c => c.symbol === symbol);
   if (!card) return;
-
-  // المصفوفات — فقط إن جاءت غير فارغة
   if (opt.call_oi && opt.call_oi.length > 0) card.call_oi = opt.call_oi;
   if (opt.put_oi  && opt.put_oi.length  > 0) card.put_oi  = opt.put_oi;
   if (opt.whales  && opt.whales.length  > 0) card.whales  = opt.whales;
-
-  // total_* — للمرجع فقط (لا تُستخدم في الحسابات)
   if ((opt.total_call_oi  || 0) > 0) card.total_call_oi  = opt.total_call_oi;
   if ((opt.total_put_oi   || 0) > 0) card.total_put_oi   = opt.total_put_oi;
   if ((opt.total_call_vol || 0) > 0) card.total_call_vol = opt.total_call_vol;
@@ -434,14 +440,12 @@ function updateCardOptions(symbol, opt) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
   if (!cardEl.classList.contains("open")) return;
-
   updateAllDynamic(cardEl, symbol, card);
 }
 
 async function fetchCardOptions(symbol) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (cardEl && !cardEl.classList.contains("open")) return;
-
   try {
     const r = await fetch(`${API_BASE}/api/options/${symbol}`);
     if (!r.ok) return;
@@ -452,9 +456,7 @@ async function fetchCardOptions(symbol) {
 }
 
 function startOptionsPolling(symbol) {
-  if (optionsTimers.has(symbol)) {
-    clearInterval(optionsTimers.get(symbol));
-  }
+  if (optionsTimers.has(symbol)) clearInterval(optionsTimers.get(symbol));
   setTimeout(() => fetchCardOptions(symbol), 10000);
   const timer = setInterval(() => fetchCardOptions(symbol), 30000);
   optionsTimers.set(symbol, timer);
@@ -464,10 +466,8 @@ function connectLive(symbol) {
   if (socketMap.has(symbol)) {
     try { socketMap.get(symbol).close(); } catch (e) {}
   }
-
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${window.location.host}/ws/${symbol}`);
-
   ws.onopen = () => {
     setConnection(true);
     ws._ping = setInterval(() => {
@@ -476,7 +476,6 @@ function connectLive(symbol) {
       }
     }, 30000);
   };
-
   ws.onclose = () => {
     if (ws._ping) clearInterval(ws._ping);
     socketMap.delete(symbol);
@@ -485,14 +484,12 @@ function connectLive(symbol) {
       reconnectTimers.set(symbol, timer);
     }
   };
-
   ws.onmessage = (ev) => {
     try {
       const m = JSON.parse(ev.data);
       updateCardPrice(m.symbol, m.price);
     } catch (e) {}
   };
-
   socketMap.set(symbol, ws);
 }
 
@@ -502,9 +499,7 @@ async function pollPrices() {
       const r = await fetch(`${API_BASE}/api/price/${card.symbol}`);
       if (!r.ok) continue;
       const d = await r.json();
-      if (d.price) {
-        updateCardPrice(card.symbol, d.price);
-      }
+      if (d.price) updateCardPrice(card.symbol, d.price);
     } catch (e) {}
   }
 }
