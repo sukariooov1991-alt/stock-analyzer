@@ -82,10 +82,11 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
+    # ✅ longbridge 4.5.0 يستخدم trade_sessions (جمع)
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
-        trade_session=TradeSessions.Intraday,
+        trade_sessions=TradeSessions.Intraday,
     )
 
 
@@ -239,7 +240,6 @@ app.add_middleware(
 # ============================================================
 @app.get("/api/status")
 def status():
-    """فحص الاتصال الفعلي بـ Longbridge"""
     try:
         ctx = get_ctx()
         q = ctx.quote(["AAPL.US"])
