@@ -1,15 +1,15 @@
 /* ============================================================
-   app.js — مع تنبيه صوتي
+   app.js — RSI+MACD Swing + Sound Alerts
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
 const reconnectTimers = new Map();
-const optionsTimers = new Map();
+const stateTimers = new Map();
 let pollTimer = null;
 
-// ✅ حالة آخر إشارة صوتية (لمنع تكرار الصوت)
-const lastAlertedState = {}; // { symbol: "green" | "red" | "yellow" | "gray" }
+// ✅ آخر حالة لكل سهم (لمنع تكرار الصوت)
+const lastAlertedState = {};
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -33,36 +33,26 @@ function playAlertSound(type) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const now = ctx.currentTime;
-
-    // نوتتين — CALL نغمة صاعدة، PUT نغمة هابطة
     const notes = type === "green" ? [523.25, 783.99] : [783.99, 523.25];
-
     notes.forEach((freq, i) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
       osc.frequency.value = freq;
-      osc.connect(gain);
-      gain.connect(ctx.destination);
+      osc.connect(gain); gain.connect(ctx.destination);
       const start = now + i * 0.2;
       gain.gain.setValueAtTime(0.3, start);
       gain.gain.exponentialRampToValueAtTime(0.01, start + 0.25);
-      osc.start(start);
-      osc.stop(start + 0.3);
+      osc.start(start); osc.stop(start + 0.3);
     });
-  } catch (e) {
-    console.warn("Audio error:", e);
-  }
+  } catch (e) {}
 }
 
-/* ✅ فحص الإشارة وإطلاق الصوت إن كانت جديدة */
-function checkAlert(symbol, color) {
+function checkSound(symbol, color) {
   const prev = lastAlertedState[symbol];
-  if (color === "green" || color === "red") {
-    if (prev !== color) {
-      playAlertSound(color);
-      console.log(`[ALERT] ${symbol} → ${color}`);
-    }
+  if ((color === "green" || color === "red") && prev !== color) {
+    playAlertSound(color);
+    console.log(`[SOUND] ${symbol} → ${color}`);
   }
   lastAlertedState[symbol] = color;
 }
@@ -105,11 +95,10 @@ async function checkBackendStatus() {
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
-    rows += `
-      <div class="oi-row" data-oi-row="${kind}-${i}">
-        <div class="oi-bar-wrap"><div class="oi-bar" data-oi-bar="${kind}-${i}" style="width:0%;background:${color};"></div></div>
-        <div class="oi-strike" data-oi-strike="${kind}-${i}">—</div>
-      </div>`;
+    rows += `<div class="oi-row" data-oi-row="${kind}-${i}">
+      <div class="oi-bar-wrap"><div class="oi-bar" data-oi-bar="${kind}-${i}" style="width:0%;background:${color};"></div></div>
+      <div class="oi-strike" data-oi-strike="${kind}-${i}">—</div>
+    </div>`;
   }
   return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
 }
@@ -122,10 +111,9 @@ function updateOIBlockData(root, kind, data) {
     const bar = root.querySelector(`[data-oi-bar="${kind}-${i}"]`);
     const strike = root.querySelector(`[data-oi-strike="${kind}-${i}"]`);
     if (i < data.length) {
-      const item = data[i];
-      const pct = ((item.oi || 0) / maxOI) * 100;
+      const pct = ((data[i].oi || 0) / maxOI) * 100;
       if (bar) bar.style.width = `${pct}%`;
-      if (strike) strike.textContent = item.strike;
+      if (strike) strike.textContent = data[i].strike;
     } else {
       if (bar) bar.style.width = "0%";
       if (strike) strike.textContent = "—";
@@ -136,13 +124,12 @@ function updateOIBlockData(root, kind, data) {
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
-    rows += `
-      <div class="whale-row" data-whale-row="${sym}-${i}" style="display:none;">
-        <div class="whale-strike" data-whale-strike="${sym}-${i}">—</div>
-        <div class="whale-vol" data-whale-vol="${sym}-${i}">Vol: <b>—</b></div>
-        <div class="whale-oi" data-whale-oi="${sym}-${i}">OI: <b>—</b></div>
-        <div class="whale-dir" data-whale-dir="${sym}-${i}">—</div>
-      </div>`;
+    rows += `<div class="whale-row" data-whale-row="${sym}-${i}" style="display:none;">
+      <div class="whale-strike" data-whale-strike="${sym}-${i}">—</div>
+      <div class="whale-vol" data-whale-vol="${sym}-${i}">Vol: <b>—</b></div>
+      <div class="whale-oi" data-whale-oi="${sym}-${i}">OI: <b>—</b></div>
+      <div class="whale-dir" data-whale-dir="${sym}-${i}">—</div>
+    </div>`;
   }
   return `<div class="whales-section" id="whales-${sym}" style="display:none;">
     <div class="whales-title">🐋 الحيتان المكتشفة</div>
@@ -192,16 +179,10 @@ function updatePutCallBars(root, sym, card) {
 
   const totalOI = totalCallOI + totalPutOI;
   let putOIPct = 50, callOIPct = 50;
-  if (totalOI > 0) {
-    putOIPct = Math.round(totalPutOI / totalOI * 100);
-    callOIPct = 100 - putOIPct;
-  }
+  if (totalOI > 0) { putOIPct = Math.round(totalPutOI / totalOI * 100); callOIPct = 100 - putOIPct; }
   const totalVol = totalCallVol + totalPutVol;
   let putVolPct = 50, callVolPct = 50;
-  if (totalVol > 0) {
-    putVolPct = Math.round(totalPutVol / totalVol * 100);
-    callVolPct = 100 - putVolPct;
-  }
+  if (totalVol > 0) { putVolPct = Math.round(totalPutVol / totalVol * 100); callVolPct = 100 - putVolPct; }
 
   const putOISpan  = root.querySelector(`#put-oi-pct-${sym}`);
   const callOISpan = root.querySelector(`#call-oi-pct-${sym}`);
@@ -237,50 +218,47 @@ function buildCard(cardData) {
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
 
-  // ✅ تشغيل الصوت عند إشارة جديدة
-  checkAlert(sym, cls);
+  // ✅ صوت عند إشارة جديدة
+  checkSound(sym, cls);
 
   const div = document.createElement("div");
   div.className = "card " + cls;
   div.dataset.symbol = sym;
 
-  const row1 = `
-    <div class="card-row row-1">
-      <div class="cell symbol-cell">${sym}</div>
-      <div class="cell price-cell">
-        <div class="val">$${price.toFixed(2)}</div>
-        <div class="sub">السعر الحالي</div>
-      </div>
-      <div class="cell score-cell">
-        <div class="val">${c.score ?? 0}%</div>
-        <div class="sub">قوة الإشارة</div>
-      </div>
-      <div class="cell badge-cell">
-        <div class="badge">🔥 ${c.label || "—"}</div>
-        <button class="card-trash">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="3 6 5 6 21 6"></polyline>
-            <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
-          </svg>
-        </button>
-      </div>
-    </div>`;
+  const row1 = `<div class="card-row row-1">
+    <div class="cell symbol-cell">${sym}</div>
+    <div class="cell price-cell">
+      <div class="val">$${price.toFixed(2)}</div>
+      <div class="sub">السعر الحالي</div>
+    </div>
+    <div class="cell score-cell">
+      <div class="val">${c.score ?? 0}%</div>
+      <div class="sub">قوة الإشارة</div>
+    </div>
+    <div class="cell badge-cell">
+      <div class="badge">🔥 ${c.label || "—"}</div>
+      <button class="card-trash">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+        </svg>
+      </button>
+    </div>
+  </div>`;
 
-  const row2 = `
-    <div class="card-row row-2">
-      <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte || "—"}</div></div>
-      <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
-      <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
-      <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
-    </div>`;
+  const row2 = `<div class="card-row row-2">
+    <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte || "—"}</div></div>
+    <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
+    <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
+    <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
+  </div>`;
 
-  const row3 = `
-    <div class="card-row row-3">
-      <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
-      <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
-    </div>`;
+  const row3 = `<div class="card-row row-3">
+    <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
+    <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
+    <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
+    <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
+  </div>`;
 
   const tfs = cardData.timeframes || [];
   const tfsHtml = tfs.map(t => `
@@ -292,46 +270,55 @@ function buildCard(cardData) {
       <div class="tf-row"><span>RVOL</span><span class="v">${t.rvol}x</span></div>
     </div>`).join("");
 
-  const oiHtml = `
-    <div class="oi-grid">
-      ${buildOIBlockStatic("PUT OI", "put-oi", "#8b5cf6")}
-      ${buildOIBlockStatic("PUT LIQUIDITY", "put-liq", "#ef4444")}
-      ${buildOIBlockStatic("CALL OI", "call-oi", "#3b82f6")}
-      ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
-    </div>`;
+  const oiHtml = `<div class="oi-grid">
+    ${buildOIBlockStatic("PUT OI", "put-oi", "#8b5cf6")}
+    ${buildOIBlockStatic("PUT LIQUIDITY", "put-liq", "#ef4444")}
+    ${buildOIBlockStatic("CALL OI", "call-oi", "#3b82f6")}
+    ${buildOIBlockStatic("CALL LIQUIDITY", "call-liq", "#22c55e")}
+  </div>`;
 
-  const barHtml = `
-    <div class="putcall-wrapper">
-      <div class="putcall-label">Open Interest</div>
-      <div class="putcall-bar">
-        <span class="put" id="put-oi-pct-${sym}">PUT 50%</span>
-        <div class="track"><div class="fill" id="call-oi-fill-${sym}" style="width:50%"></div></div>
-        <span class="call" id="call-oi-pct-${sym}">50% CALL</span>
-      </div>
-      <div class="putcall-label">Liquidity (Volume)</div>
-      <div class="putcall-bar">
-        <span class="put" id="put-vol-pct-${sym}">PUT 50%</span>
-        <div class="track"><div class="fill" id="call-vol-fill-${sym}" style="width:50%"></div></div>
-        <span class="call" id="call-vol-pct-${sym}">50% CALL</span>
-      </div>
-    </div>`;
+  const barHtml = `<div class="putcall-wrapper">
+    <div class="putcall-label">Open Interest</div>
+    <div class="putcall-bar">
+      <span class="put" id="put-oi-pct-${sym}">PUT 50%</span>
+      <div class="track"><div class="fill" id="call-oi-fill-${sym}" style="width:50%"></div></div>
+      <span class="call" id="call-oi-pct-${sym}">50% CALL</span>
+    </div>
+    <div class="putcall-label">Liquidity (Volume)</div>
+    <div class="putcall-bar">
+      <span class="put" id="put-vol-pct-${sym}">PUT 50%</span>
+      <div class="track"><div class="fill" id="call-vol-fill-${sym}" style="width:50%"></div></div>
+      <span class="call" id="call-vol-pct-${sym}">50% CALL</span>
+    </div>
+  </div>`;
 
   const whalesHtml = buildWhalesStatic(sym);
 
-  const expanded = `
-    <div class="card-expanded">
-      <div class="tf-grid">${tfsHtml}</div>
-      ${oiHtml}
-      ${barHtml}
-      ${whalesHtml}
-      <div class="bottom-grid">
-        <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
-        <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-        <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-        <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
-      </div>
-      <div class="summary">${buildSummary(cardData)}</div>
-    </div>`;
+  // ✅ قسم تحليل الاستراتيجية الجديدة
+  const adxOk = c.adx_ok ? "✅" : "❌";
+  const volOk = c.volume_ok ? "✅" : "❌";
+  const stratHtml = `<div class="strategy-section">
+    <div class="strategy-title">📊 تحليل الاستراتيجية (RSI + MACD)</div>
+    <div class="strategy-row"><span>MACD أسبوعي:</span><b>${c.weekly_macd ?? "—"}</b></div>
+    <div class="strategy-row"><span>RSI يومي:</span><b>${c.daily_rsi ?? "—"}</b></div>
+    <div class="strategy-row"><span>ADX (22):</span><b>${c.adx ?? "—"} ${adxOk}</b></div>
+    <div class="strategy-row"><span>Volume (1.5x):</span><b>${volOk}</b></div>
+  </div>`;
+
+  const expanded = `<div class="card-expanded">
+    ${stratHtml}
+    <div class="tf-grid">${tfsHtml}</div>
+    ${oiHtml}
+    ${barHtml}
+    ${whalesHtml}
+    <div class="bottom-grid">
+      <div class="cell"><div class="label">VWAP</div><div class="val">$${cardData.vwap ?? "—"}</div></div>
+      <div class="cell"><div class="label">مقاومات</div><div class="val">${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
+      <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
+    </div>
+    <div class="summary">📌 استراتيجية: RSI+MACD Swing — ${c.label || "—"}</div>
+  </div>`;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
   updateAllDynamic(div, sym, cardData);
@@ -345,15 +332,6 @@ function buildCard(cardData) {
   });
 
   return div;
-}
-
-function buildSummary(c) {
-  const p = [];
-  if (c.sweep) p.push("سحب سيولة ✓");
-  if (c.ifvg) p.push("IFVG ✓");
-  if (c.mss) p.push("MSS ✓");
-  const dir = c.card?.color === "green" ? "CALL" : c.card?.color === "red" ? "PUT" : "انتظار";
-  return `📌 إشارة ${dir} — ${p.join(" | ") || "لا توجد شروط محققة"}.`;
 }
 
 function renderCards() {
@@ -390,7 +368,7 @@ async function searchSymbol(symbol) {
     saveCards();
     renderCards();
     connectLive(symbol);
-    startOptionsPolling(symbol);
+    startStatePolling(symbol);
   } catch (e) {
     setConnection(false);
     alert("تعذّر الاتصال:\n" + e.message);
@@ -400,18 +378,11 @@ async function searchSymbol(symbol) {
 function deleteCard(symbol) {
   cards = cards.filter(c => c.symbol !== symbol);
   saveCards(); renderCards();
-  if (socketMap.has(symbol)) {
-    try { socketMap.get(symbol).close(); } catch (e) {}
-    socketMap.delete(symbol);
-  }
-  if (reconnectTimers.has(symbol)) {
-    clearTimeout(reconnectTimers.get(symbol));
-    reconnectTimers.delete(symbol);
-  }
-  if (optionsTimers.has(symbol)) {
-    clearInterval(optionsTimers.get(symbol));
-    optionsTimers.delete(symbol);
-  }
+  if (socketMap.has(symbol)) { try { socketMap.get(symbol).close(); } catch (e) {} socketMap.delete(symbol); }
+  if (reconnectTimers.has(symbol)) { clearTimeout(reconnectTimers.get(symbol)); reconnectTimers.delete(symbol); }
+  if (stateTimers.has(symbol)) { clearInterval(stateTimers.get(symbol)); stateTimers.delete(symbol); }
+  // ✅ إزالة من قائمة المراقبة
+  fetch(`${API_BASE}/api/remove/${symbol}`).catch(() => {});
 }
 
 function updateCardPrice(symbol, price) {
@@ -421,59 +392,51 @@ function updateCardPrice(symbol, price) {
     card.price = price;
     const el = cardsArea.querySelector(`[data-symbol="${symbol}"] .price-cell .val`);
     if (el) el.textContent = "$" + parseFloat(price).toFixed(2);
-    const elBottom = cardsArea.querySelector(`[data-symbol="${symbol}"] .bottom-grid .cell:last-child .val`);
-    if (elBottom) elBottom.textContent = "$" + parseFloat(price).toFixed(2);
   }
 }
 
-function updateCardOptions(symbol, opt) {
-  const card = cards.find(c => c.symbol === symbol);
-  if (!card) return;
-  if (opt.call_oi && opt.call_oi.length > 0) card.call_oi = opt.call_oi;
-  if (opt.put_oi  && opt.put_oi.length  > 0) card.put_oi  = opt.put_oi;
-  if (opt.whales  && opt.whales.length  > 0) card.whales  = opt.whales;
-  if ((opt.total_call_oi  || 0) > 0) card.total_call_oi  = opt.total_call_oi;
-  if ((opt.total_put_oi   || 0) > 0) card.total_put_oi   = opt.total_put_oi;
-  if ((opt.total_call_vol || 0) > 0) card.total_call_vol = opt.total_call_vol;
-  if ((opt.total_put_vol  || 0) > 0) card.total_put_vol  = opt.total_put_vol;
+/* ✅ تحديث كامل للبطاقة عند تغيّر الحالة */
+function rebuildCard(symbol, newData) {
+  const idx = cards.findIndex(c => c.symbol === symbol);
+  if (idx === -1) return;
+  const oldColor = cards[idx].card?.color;
+  const newColor = newData.card?.color;
+  cards[idx] = newData;
 
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (!cardEl) return;
-  if (!cardEl.classList.contains("open")) return;
-  updateAllDynamic(cardEl, symbol, card);
+  const oldEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (oldEl) {
+    const wasOpen = oldEl.classList.contains("open");
+    const newEl = buildCard(newData);
+    if (wasOpen) newEl.classList.add("open");
+    oldEl.replaceWith(newEl);
+  }
+  checkSound(symbol, newColor);
+  renderCards();
 }
 
-async function fetchCardOptions(symbol) {
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (cardEl && !cardEl.classList.contains("open")) return;
+async function fetchState(symbol) {
   try {
-    const r = await fetch(`${API_BASE}/api/options/${symbol}`);
+    const r = await fetch(`${API_BASE}/api/analyze/${symbol}`);
     if (!r.ok) return;
     const d = await r.json();
-    if (d.error) return;
-    updateCardOptions(symbol, d);
+    rebuildCard(symbol, d);
   } catch (e) {}
 }
 
-function startOptionsPolling(symbol) {
-  if (optionsTimers.has(symbol)) clearInterval(optionsTimers.get(symbol));
-  setTimeout(() => fetchCardOptions(symbol), 10000);
-  const timer = setInterval(() => fetchCardOptions(symbol), 30000);
-  optionsTimers.set(symbol, timer);
+function startStatePolling(symbol) {
+  if (stateTimers.has(symbol)) clearInterval(stateTimers.get(symbol));
+  const timer = setInterval(() => fetchState(symbol), 60000); // كل دقيقة
+  stateTimers.set(symbol, timer);
 }
 
 function connectLive(symbol) {
-  if (socketMap.has(symbol)) {
-    try { socketMap.get(symbol).close(); } catch (e) {}
-  }
+  if (socketMap.has(symbol)) { try { socketMap.get(symbol).close(); } catch (e) {} }
   const proto = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${window.location.host}/ws/${symbol}`);
   ws.onopen = () => {
     setConnection(true);
     ws._ping = setInterval(() => {
-      if (ws.readyState === WebSocket.OPEN) {
-        try { ws.send("ping"); } catch (e) {}
-      }
+      if (ws.readyState === WebSocket.OPEN) { try { ws.send("ping"); } catch (e) {} }
     }, 30000);
   };
   ws.onclose = () => {
@@ -516,7 +479,7 @@ searchForm.addEventListener("submit", (e) => {
   renderCards();
   cards.forEach(c => {
     connectLive(c.symbol);
-    startOptionsPolling(c.symbol);
+    startStatePolling(c.symbol);
   });
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
