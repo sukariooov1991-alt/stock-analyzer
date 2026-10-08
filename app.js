@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — RSI+MACD Swing + Sound Alerts
+   app.js — RSI+MACD Swing (Strategy مدمج في الشريط السفلي)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -8,7 +8,6 @@ const reconnectTimers = new Map();
 const stateTimers = new Map();
 let pollTimer = null;
 
-// ✅ آخر حالة لكل سهم (لمنع تكرار الصوت)
 const lastAlertedState = {};
 
 function saveCards() {
@@ -28,7 +27,6 @@ const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
 
-/* ✅ تشغيل الصوت */
 function playAlertSound(type) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -37,8 +35,7 @@ function playAlertSound(type) {
     notes.forEach((freq, i) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
+      osc.type = "sine"; osc.frequency.value = freq;
       osc.connect(gain); gain.connect(ctx.destination);
       const start = now + i * 0.2;
       gain.gain.setValueAtTime(0.3, start);
@@ -52,7 +49,6 @@ function checkSound(symbol, color) {
   const prev = lastAlertedState[symbol];
   if ((color === "green" || color === "red") && prev !== color) {
     playAlertSound(color);
-    console.log(`[SOUND] ${symbol} → ${color}`);
   }
   lastAlertedState[symbol] = color;
 }
@@ -211,6 +207,45 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
+/* ✅ الشريط السفلي المدمج — كل تفاصيل الاستراتيجية هنا */
+function buildSummaryBar(cardData) {
+  const c = cardData.card || {};
+  const color = c.color || "gray";
+  const label = c.label || "—";
+
+  const macd = c.weekly_macd ?? "—";
+  const rsi  = c.daily_rsi   ?? "—";
+  const adx  = c.adx         ?? "—";
+  const adxOk = !!c.adx_ok;
+  const volOk = !!c.volume_ok;
+
+  const macdIcon = (typeof macd === "number")
+    ? (macd > 0 ? "🟢" : macd < 0 ? "🔴" : "⚪")
+    : "⚪";
+
+  let rsiIcon = "⏸️";
+  if (c.status === "call") rsiIcon = "🟢";
+  else if (c.status === "put") rsiIcon = "🔴";
+
+  const adxIcon = adxOk ? "✅" : "❌";
+  const volIcon = volOk ? "✅" : "❌";
+
+  return `
+    <div class="summary-bar">
+      <div class="summary-badge badge-${color}">${label}</div>
+      <div class="summary-metrics">
+        <span class="metric"><span class="mlabel">MACD</span> <b>${macd}</b> ${macdIcon}</span>
+        <span class="sep">·</span>
+        <span class="metric"><span class="mlabel">RSI</span> <b>${rsi}</b> ${rsiIcon}</span>
+        <span class="sep">·</span>
+        <span class="metric"><span class="mlabel">ADX</span> <b>${adx}</b> ${adxIcon}</span>
+        <span class="sep">·</span>
+        <span class="metric"><span class="mlabel">VOL</span> ${volIcon}</span>
+      </div>
+    </div>
+  `;
+}
+
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -218,7 +253,6 @@ function buildCard(cardData) {
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
 
-  // ✅ صوت عند إشارة جديدة
   checkSound(sym, cls);
 
   const div = document.createElement("div");
@@ -294,19 +328,7 @@ function buildCard(cardData) {
 
   const whalesHtml = buildWhalesStatic(sym);
 
-  // ✅ قسم تحليل الاستراتيجية الجديدة
-  const adxOk = c.adx_ok ? "✅" : "❌";
-  const volOk = c.volume_ok ? "✅" : "❌";
-  const stratHtml = `<div class="strategy-section">
-    <div class="strategy-title">📊 تحليل الاستراتيجية (RSI + MACD)</div>
-    <div class="strategy-row"><span>MACD أسبوعي:</span><b>${c.weekly_macd ?? "—"}</b></div>
-    <div class="strategy-row"><span>RSI يومي:</span><b>${c.daily_rsi ?? "—"}</b></div>
-    <div class="strategy-row"><span>ADX (22):</span><b>${c.adx ?? "—"} ${adxOk}</b></div>
-    <div class="strategy-row"><span>Volume (1.5x):</span><b>${volOk}</b></div>
-  </div>`;
-
   const expanded = `<div class="card-expanded">
-    ${stratHtml}
     <div class="tf-grid">${tfsHtml}</div>
     ${oiHtml}
     ${barHtml}
@@ -317,7 +339,7 @@ function buildCard(cardData) {
       <div class="cell"><div class="label">دعوم</div><div class="val">${(cardData.supports||[]).join(" / ") || "—"}</div></div>
       <div class="cell"><div class="label">السعر</div><div class="val">$${price.toFixed(2)}</div></div>
     </div>
-    <div class="summary">📌 استراتيجية: RSI+MACD Swing — ${c.label || "—"}</div>
+    ${buildSummaryBar(cardData)}
   </div>`;
 
   div.innerHTML = row1 + row2 + row3 + expanded;
@@ -381,7 +403,6 @@ function deleteCard(symbol) {
   if (socketMap.has(symbol)) { try { socketMap.get(symbol).close(); } catch (e) {} socketMap.delete(symbol); }
   if (reconnectTimers.has(symbol)) { clearTimeout(reconnectTimers.get(symbol)); reconnectTimers.delete(symbol); }
   if (stateTimers.has(symbol)) { clearInterval(stateTimers.get(symbol)); stateTimers.delete(symbol); }
-  // ✅ إزالة من قائمة المراقبة
   fetch(`${API_BASE}/api/remove/${symbol}`).catch(() => {});
 }
 
@@ -395,11 +416,9 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ تحديث كامل للبطاقة عند تغيّر الحالة */
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
-  const oldColor = cards[idx].card?.color;
   const newColor = newData.card?.color;
   cards[idx] = newData;
 
@@ -425,7 +444,7 @@ async function fetchState(symbol) {
 
 function startStatePolling(symbol) {
   if (stateTimers.has(symbol)) clearInterval(stateTimers.get(symbol));
-  const timer = setInterval(() => fetchState(symbol), 60000); // كل دقيقة
+  const timer = setInterval(() => fetchState(symbol), 60000);
   stateTimers.set(symbol, timer);
 }
 
