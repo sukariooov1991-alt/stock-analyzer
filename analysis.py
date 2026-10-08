@@ -1,225 +1,181 @@
 """
-analysis.py
-المؤشرات الفنية + منطق SMC + نظام النقاط + المستويات
+analysis.py — الاستراتيجية: RSI + MACD Swing (CALL + PUT)
+مع فلاتر: ADX + Volume
 """
 import numpy as np
 import pandas as pd
-from typing import Optional
 
 
-# ============================================================
-# المؤشرات الفنية
-# ============================================================
-def ema(s: pd.Series, n: int) -> pd.Series:
+def ema(s, n):
     return s.ewm(span=n, adjust=False).mean()
 
 
-def rsi(s: pd.Series, n: int = 14) -> pd.Series:
+def rsi(s, n=14):
     d = s.diff()
-    g = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    g = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
     rs = g / l.replace(0, np.nan)
     return 100 - 100 / (1 + rs)
 
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+def atr(df, n=14):
     h, l, c = df["high"], df["low"], df["close"]
     pc = c.shift(1)
-    tr = pd.concat(
-        [h - l, (h - pc).abs(), (l - pc).abs()], axis=1
-    ).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/n, adjust=False).mean()
 
 
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+def adx(df, n=14):
     h, l = df["high"], df["low"]
     up, dn = h.diff(), -l.diff()
     pdm = np.where((up > dn) & (up > 0), up, 0.0)
     ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
     a = atr(df, n)
-    pdi = 100 * pd.Series(pdm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / a
-    ndi = 100 * pd.Series(ndm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / a
+    pdi = 100 * pd.Series(pdm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / a
+    ndi = 100 * pd.Series(ndm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / a
     dx = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
-    return dx.ewm(alpha=1 / n, adjust=False).mean()
+    return dx.ewm(alpha=1/n, adjust=False).mean()
 
 
-def vwap(df: pd.DataFrame) -> pd.Series:
+def vwap(df):
     tp = (df["high"] + df["low"] + df["close"]) / 3
     return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
 
 
-def swing_highs(df: pd.DataFrame, k: int = 2) -> list:
-    h = df["high"].values
-    return [
-        i for i in range(k, len(h) - k)
-        if all(h[i] > h[i - j] for j in range(1, k + 1))
-        and all(h[i] > h[i + j] for j in range(1, k + 1))
-    ]
-
-
-def swing_lows(df: pd.DataFrame, k: int = 2) -> list:
-    l = df["low"].values
-    return [
-        i for i in range(k, len(l) - k)
-        if all(l[i] < l[i - j] for j in range(1, k + 1))
-        and all(l[i] < l[i + j] for j in range(1, k + 1))
-    ]
-
-
-def rvol(df: pd.DataFrame, n: int = 20) -> float:
+def rvol(df, n=20):
     if len(df) < n + 1:
         return 1.0
-    avg = df["volume"].iloc[-n - 1:-1].mean()
+    avg = df["volume"].iloc[-n-1:-1].mean()
     return float(df["volume"].iloc[-1] / avg) if avg > 0 else 1.0
 
 
+def macd(s, fast=12, slow=26, signal=9):
+    ema_fast = s.ewm(span=fast, adjust=False).mean()
+    ema_slow = s.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
 # ============================================================
-# SMC — اكتشاف سحب السيولة
+# ✅ الاستراتيجية الجديدة: RSI + MACD Swing
 # ============================================================
-def detect_sweep(df: pd.DataFrame, level: float, direction: str) -> Optional[dict]:
+def swing_signal(df_weekly, df_daily):
     """
-    direction = "low"  → سحب من قاع (bullish)
-    direction = "high" → سحب من قمة (bearish)
-    الشروط: wick يكسر بـ 0.05%–0.5% + body يغلق فوق/تحت المستوى خلال 1-2 شمعة
+    CALL: Weekly MACD > 0 AND Daily RSI crosses UP through 45
+    PUT:  Weekly MACD < 0 AND Daily RSI crosses DOWN through 55
+    الفلاتر: ADX > 22 + Volume >= 1.5 × SMA(20)
     """
-    n = len(df)
-    for i in range(max(0, n - 3), n):
-        r = df.iloc[i]
-        if direction == "low" and r["low"] < level and r["close"] > level:
-            pct = (level - r["low"]) / level * 100
-            if 0.05 <= pct <= 0.5:
-                return {
-                    "index": i,
-                    "sweep": float(r["low"]),
-                    "level": float(level),
-                    "percent": round(pct, 3),
-                    "type": "bullish",
-                }
-        if direction == "high" and r["high"] > level and r["close"] < level:
-            pct = (r["high"] - level) / level * 100
-            if 0.05 <= pct <= 0.5:
-                return {
-                    "index": i,
-                    "sweep": float(r["high"]),
-                    "level": float(level),
-                    "percent": round(pct, 3),
-                    "type": "bearish",
-                }
-    return None
+    # MACD أسبوعي
+    w_macd, _, _ = macd(df_weekly["close"])
+    weekly_macd = float(w_macd.iloc[-1])
+
+    # RSI يومي
+    d_rsi = rsi(df_daily["close"], 14)
+    rsi_now  = float(d_rsi.iloc[-1])
+    rsi_prev = float(d_rsi.iloc[-2]) if len(d_rsi) > 1 else rsi_now
+
+    # ADX يومي
+    d_adx = adx(df_daily, 14)
+    adx_now = float(d_adx.iloc[-1])
+    adx_ok = adx_now > 22
+
+    # Volume يومي
+    vol_now = float(df_daily["volume"].iloc[-1])
+    vol_avg = float(df_daily["volume"].iloc[-21:-1].mean()) if len(df_daily) >= 21 else vol_now
+    volume_ok = vol_now >= 1.5 * vol_avg if vol_avg > 0 else False
+
+    # ATR يومي
+    d_atr = atr(df_daily, 14)
+    atr_now = float(d_atr.iloc[-1])
+
+    # ===== تحديد الإشارة =====
+    signal = "none"
+    direction = None
+
+    if weekly_macd > 0:
+        direction = "bullish"
+        if rsi_prev < 45 <= rsi_now:
+            signal = "call"
+        elif rsi_now >= 45:
+            signal = "wait_call"
+    elif weekly_macd < 0:
+        direction = "bearish"
+        if rsi_prev > 55 >= rsi_now:
+            signal = "put"
+        elif rsi_now <= 55:
+            signal = "wait_put"
+
+    filters_ok = adx_ok and volume_ok
+
+    # ===== تحديد اللون =====
+    if signal in ("call", "put") and filters_ok:
+        color = "green" if signal == "call" else "red"
+        label = "تأكيد CALL" if signal == "call" else "تأكيد PUT"
+        status = signal
+    elif signal in ("call", "put") and not filters_ok:
+        # الإشارة تحققت لكن الفلاتر لا
+        color = "yellow"
+        label = "انتظار"
+        status = "wait"
+    elif signal in ("wait_call", "wait_put"):
+        color = "yellow"
+        label = "انتظار"
+        status = "wait"
+    else:
+        color = "gray"
+        label = "لم تجتز"
+        status = "gray"
+
+    # ===== نظام النقاط (100) =====
+    score = 0
+    if direction:                                   # 40 (MACD في الاتجاه)
+        score += 40
+    if signal in ("call", "put"):                   # 30 (RSI عبر)
+        score += 30
+    elif signal in ("wait_call", "wait_put"):       # 15 (الاتجاه موجود، RSI ينتظر)
+        score += 15
+    if adx_ok:                                      # 10
+        score += 10
+    if volume_ok:                                   # 10
+        score += 10
+    if signal in ("call", "put") and filters_ok:    # 10 (كل شيء مكتمل)
+        score += 10
+    score = min(score, 100)
+
+    return {
+        "signal": signal,
+        "direction": direction,
+        "color": color,
+        "label": label,
+        "status": status,
+        "score": score,
+        "weekly_macd": round(weekly_macd, 3),
+        "daily_rsi": round(rsi_now, 1),
+        "rsi_prev": round(rsi_prev, 1),
+        "adx": round(adx_now, 1),
+        "adx_ok": adx_ok,
+        "volume_ok": volume_ok,
+        "atr": round(atr_now, 2),
+    }
 
 
-# ============================================================
-# SMC — اكتشاف IFVG
-# ============================================================
-def find_ifvg(df: pd.DataFrame, atr_s: pd.Series, direction: str = "bullish") -> Optional[dict]:
-    """
-    bullish: bearish FVG أُغلقت شمعة فوق أعلاها بجسمها كامل → تصبح دعم (IFVG)
-    bearish: bullish FVG أُغلقت شمعة تحت أدناها بجسمها كامل → تصبح مقاومة (IFVG)
-    الحد الأدنى للحجم: ATR(14) × 0.5
-    """
-    n = len(df)
-    start = max(2, n - 30)
-    for i in range(n - 1, start, -1):
-        c0, c2 = df.iloc[i - 2], df.iloc[i]
-        a = atr_s.iloc[i]
-        if direction == "bullish" and c0["low"] > c2["high"]:
-            top, bot = c0["low"], c2["high"]
-            if top - bot >= 0.5 * a:
-                for j in range(i + 1, n):
-                    rj = df.iloc[j]
-                    if min(rj["open"], rj["close"]) > top:
-                        return {
-                            "type": "bullish",
-                            "top": float(top),
-                            "bottom": float(bot),
-                            "ce": float((top + bot) / 2),
-                            "size": float(top - bot),
-                            "confirm_index": j,
-                        }
-        if direction == "bearish" and c0["high"] < c2["low"]:
-            bot, top = c0["high"], c2["low"]
-            if top - bot >= 0.5 * a:
-                for j in range(i + 1, n):
-                    rj = df.iloc[j]
-                    if max(rj["open"], rj["close"]) < bot:
-                        return {
-                            "type": "bearish",
-                            "top": float(top),
-                            "bottom": float(bot),
-                            "ce": float((top + bot) / 2),
-                            "size": float(top - bot),
-                            "confirm_index": j,
-                        }
-    return None
-
-
-# ============================================================
-# SMC — MSS
-# ============================================================
-def check_mss(df: pd.DataFrame, swing_index: Optional[int], direction: str) -> bool:
-    if swing_index is None:
-        return False
-    level = df["high"].iloc[swing_index] if direction == "bullish" else df["low"].iloc[swing_index]
-    for j in range(swing_index + 1, len(df)):
-        rj = df.iloc[j]
-        if direction == "bullish" and min(rj["open"], rj["close"]) > level:
-            return True
-        if direction == "bearish" and max(rj["open"], rj["close"]) < level:
-            return True
-    return False
-
-
-# ============================================================
-# الفلاتر الإضافية
-# ============================================================
-def check_momentum(df: pd.DataFrame, atr_val: float) -> bool:
-    r = df.iloc[-1]
-    body = abs(r["close"] - r["open"])
-    avg_vol = df["volume"].iloc[-20:].mean()
-    return body >= 1.2 * atr_val and r["volume"] >= 1.5 * avg_vol
-
-
-def check_retest(df: pd.DataFrame, ifvg: dict) -> bool:
-    """Low يلامس الفجوة والإغلاق فوق منتصفها"""
-    r = df.iloc[-1]
-    return r["low"] <= ifvg["top"] and r["close"] >= ifvg["ce"]
-
-
-# ============================================================
-# نظام النقاط
-# ============================================================
-def calculate_score(sweep, ifvg, trend, rth, momentum, retest) -> int:
-    s = 0
-    if sweep:    s += 30
-    if ifvg:     s += 30
-    if trend:    s += 15
-    if rth:      s += 10
-    if momentum: s += 10
-    if retest:   s += 5
-    return min(s, 100)
-
-
-def classify_card(sweep, ifvg, direction: str) -> dict:
-    if not sweep:
-        return {"status": "gray",   "color": "gray",   "label": "لم تجتز"}
-    if not ifvg:
-        return {"status": "wait",   "color": "yellow", "label": "انتظار"}
-    if direction == "bullish":
-        return {"status": "call",   "color": "green",  "label": "تأكيد CALL"}
-    return     {"status": "put",    "color": "red",    "label": "تأكيد PUT"}
-
-
-# ============================================================
-# المستويات
-# ============================================================
-def compute_levels(entry: float, sweep_level: float, ifvg_bottom: float,
-                   htf_target: float, atr_val: float) -> dict:
-    stop = min(sweep_level, ifvg_bottom) - 0.1 * atr_val
-    risk = entry - stop
+def compute_swing_levels(entry, atr_val, direction):
+    """مستويات السوينغ الأسبوعي"""
+    if direction == "bearish":
+        stop = entry + 0.5 * atr_val
+        risk = stop - entry
+        t1 = entry - risk
+        t2 = entry - 2 * risk
+    else:
+        stop = entry - 0.5 * atr_val
+        risk = entry - stop
+        t1 = entry + risk
+        t2 = entry + 2 * risk
     return {
         "entry":   round(entry, 2),
         "stop":    round(stop, 2),
-        "target1": round(entry + 2 * risk, 2),
-        "target2": round(htf_target, 2),
-        "risk":    round(risk, 2),
+        "target1": round(t1, 2),
+        "target2": round(t2, 2),
     }
