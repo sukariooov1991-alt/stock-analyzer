@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Smooth Updates (بدون وميض)
+   app.js — Smooth Updates (بدون وميض + تجاهل الردود الفارغة)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -60,7 +60,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== OI Block — بنية ثابتة بـ 5 صفوف ===== */
+/* ===== OI Block — بنية ثابتة 5 صفوف ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -78,7 +78,7 @@ function buildOIBlockStatic(title, kind, color) {
   `;
 }
 
-/* ===== تحديث OI Block (بدون إعادة بناء) ===== */
+/* ===== تحديث OI Block — بدون إعادة بناء ===== */
 function updateOIBlockData(root, kind, data) {
   if (!root) return;
   data = data || [];
@@ -159,7 +159,7 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ===== الشرائط الكبيرة (OI + Volume) ===== */
+/* ===== الشرائط الكبيرة ===== */
 function updatePutCallBars(root, sym, card) {
   const totalCallOI  = card.total_call_oi  || 0;
   const totalPutOI   = card.total_put_oi   || 0;
@@ -195,7 +195,7 @@ function updatePutCallBars(root, sym, card) {
   if (callVolFill) callVolFill.style.width = `${callVolPct}%`;
 }
 
-/* ===== تحديث جميع العناصر الديناميكية في root ===== */
+/* ===== تحديث كل العناصر الديناميكية ===== */
 function updateAllDynamic(root, sym, card) {
   if (!root || !card) return;
   const callOI = card.call_oi || [];
@@ -210,6 +210,7 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
+/* ===== بناء البطاقة ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -319,7 +320,7 @@ function buildCard(cardData) {
 
   div.innerHTML = row1 + row2 + row3 + expanded;
 
-  // ✅ ملء البيانات الديناميكية الآن (بدون وميض لاحقاً)
+  // ملء البيانات الديناميكية مبدئياً
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
@@ -412,18 +413,28 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ تحديث الخيارات — بدون إعادة بناء */
+/* ✅ تحديث الخيارات — بدون مسح + يتجاهل الردود الفارغة */
 function updateCardOptions(symbol, opt) {
   const card = cards.find(c => c.symbol === symbol);
   if (!card) return;
 
-  if (opt.total_call_oi  != null) card.total_call_oi  = opt.total_call_oi;
-  if (opt.total_put_oi   != null) card.total_put_oi   = opt.total_put_oi;
-  if (opt.total_call_vol != null) card.total_call_vol = opt.total_call_vol;
-  if (opt.total_put_vol  != null) card.total_put_vol  = opt.total_put_vol;
-  if (opt.call_oi)  card.call_oi = opt.call_oi;
-  if (opt.put_oi)   card.put_oi  = opt.put_oi;
-  if (opt.whales)   card.whales  = opt.whales;
+  // تحقق من صحة الرد
+  const hasValidOI  = (opt.total_call_oi || 0) + (opt.total_put_oi || 0) > 0;
+  const hasValidArr = (opt.call_oi && opt.call_oi.length > 0)
+                   || (opt.put_oi  && opt.put_oi.length  > 0);
+
+  if (!hasValidOI || !hasValidArr) {
+    console.warn(`[options] empty response for ${symbol} — keeping old data`);
+    return;
+  }
+
+  card.total_call_oi  = opt.total_call_oi;
+  card.total_put_oi   = opt.total_put_oi;
+  card.total_call_vol = opt.total_call_vol || 0;
+  card.total_put_vol  = opt.total_put_vol  || 0;
+  card.call_oi = opt.call_oi || [];
+  card.put_oi  = opt.put_oi  || [];
+  card.whales  = opt.whales  || [];
 
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
@@ -432,11 +443,16 @@ function updateCardOptions(symbol, opt) {
   updateAllDynamic(cardEl, symbol, card);
 }
 
+/* ✅ جلب الخيارات — لا يحدّث البطاقات المغلقة */
 async function fetchCardOptions(symbol) {
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (cardEl && !cardEl.classList.contains("open")) return;
+
   try {
     const r = await fetch(`${API_BASE}/api/options/${symbol}`);
     if (!r.ok) return;
     const d = await r.json();
+    if (d.error) return;
     updateCardOptions(symbol, d);
   } catch (e) {}
 }
