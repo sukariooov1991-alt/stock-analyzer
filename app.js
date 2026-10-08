@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — النسخة النهائية مع إعادة اتصال WebSocket
+   app.js — النسخة النهائية
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -23,7 +23,6 @@ const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
 
-/* الثيم */
 function applyTheme(light) {
   document.body.classList.toggle("light", light);
   themeIcon.textContent = light ? "☀️" : "🌙";
@@ -32,7 +31,6 @@ function applyTheme(light) {
 themeBtn.addEventListener("click", () => applyTheme(!document.body.classList.contains("light")));
 applyTheme(localStorage.getItem("theme") === "light");
 
-/* حالة السوق */
 function updateMarketStatus() {
   const now = new Date();
   const nyH = (now.getUTCHours() - 4 + 24) % 24;
@@ -48,7 +46,6 @@ function updateMarketStatus() {
 updateMarketStatus();
 setInterval(updateMarketStatus, 60000);
 
-/* الاتصال */
 function setConnection(online) {
   connectionStatus.className = "status " + (online ? "online" : "offline");
   connectionStatus.querySelector(".label").textContent = online ? "متصل" : "غير متصل";
@@ -61,7 +58,6 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* OI Block */
 function buildOIBlock(title, data, color) {
   if (!data || !data.length) {
     return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-empty">—</div></div>`;
@@ -113,19 +109,19 @@ function buildCard(cardData) {
 
   const row2 = `
     <div class="card-row row-2">
-      <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
-      <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
-      <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
       <div class="cell"><div class="label">DTE</div><div class="val">${lv.dte || "—"}</div></div>
+      <div class="cell"><div class="label">PRICE</div><div class="val">${lv.premium && lv.premium !== "—" ? "$" + lv.premium : "—"}</div></div>
+      <div class="cell"><div class="label">EXPIRY</div><div class="val">${lv.expiry || "—"}</div></div>
+      <div class="cell"><div class="label">STRIKE</div><div class="val">${lv.strike || "—"}</div></div>
     </div>
   `;
 
   const row3 = `
     <div class="card-row row-3">
-      <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
-      <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
       <div class="cell"><div class="label">STOP</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
+      <div class="cell"><div class="label">TARGET 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
+      <div class="cell"><div class="label">TARGET 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
+      <div class="cell"><div class="label">ENTRY</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
     </div>
   `;
 
@@ -151,11 +147,16 @@ function buildCard(cardData) {
     </div>
   `;
 
-  const totalCallOI = callOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const totalPutOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const total = totalCallOI + totalPutOI;
-  const putPct = total ? Math.round(totalPutOI / total * 100) : 50;
-  const callPct = 100 - putPct;
+  /* ✅ شريط CALL/PUT — من الإجمالي الكامل للسلسلة */
+  const totalCall = cardData.total_call_oi || 0;
+  const totalPut  = cardData.total_put_oi || 0;
+  const total = totalCall + totalPut;
+
+  let putPct = 50, callPct = 50;
+  if (total > 0) {
+    putPct = Math.round(totalPut / total * 100);
+    callPct = 100 - putPct;
+  }
 
   const barHtml = `
     <div class="putcall-bar">
@@ -255,7 +256,16 @@ function deleteCard(symbol) {
   }
 }
 
-/* ✅ WebSocket مع إعادة اتصال تلقائي و ping */
+function updateCardPrice(symbol, price) {
+  const card = cards.find(c => c.symbol === symbol);
+  if (!card) return;
+  if (price && price > 0 && price !== card.price) {
+    card.price = price;
+    const el = cardsArea.querySelector(`[data-symbol="${symbol}"] .price-cell .val`);
+    if (el) el.textContent = "$" + parseFloat(price).toFixed(2);
+  }
+}
+
 function connectLive(symbol) {
   if (socketMap.has(symbol)) {
     try { socketMap.get(symbol).close(); } catch (e) {}
@@ -266,7 +276,6 @@ function connectLive(symbol) {
 
   ws.onopen = () => {
     setConnection(true);
-    // ✅ ping كل 30 ثانية لإبقاء الاتصال حياً ومنع Render من النوم
     ws._ping = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         try { ws.send("ping"); } catch (e) {}
@@ -275,27 +284,18 @@ function connectLive(symbol) {
   };
 
   ws.onclose = () => {
-    setConnection(false);
     if (ws._ping) clearInterval(ws._ping);
     socketMap.delete(symbol);
-
-    // ✅ إعادة الاتصال بعد 5 ثوان
     if (cards.find(c => c.symbol === symbol)) {
       const timer = setTimeout(() => connectLive(symbol), 5000);
       reconnectTimers.set(symbol, timer);
     }
   };
 
-  ws.onerror = () => setConnection(false);
-
   ws.onmessage = (ev) => {
     try {
       const m = JSON.parse(ev.data);
-      const card = cards.find(c => c.symbol === m.symbol);
-      if (!card) return;
-      card.price = m.price;
-      const el = cardsArea.querySelector(`[data-symbol="${m.symbol}"] .price-cell .val`);
-      if (el) el.textContent = "$" + m.price.toFixed(2);
+      updateCardPrice(m.symbol, m.price);
     } catch (e) {}
   };
 
