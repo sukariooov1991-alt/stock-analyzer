@@ -1,10 +1,11 @@
 """
-main.py — FastAPI + WebSocket + Longbridge
-السعر اللحظي + OI + Volume + الحيتان
+main.py — FastAPI + WebSocket + Longbridge + Telegram Alerts
 """
 import os
 import asyncio
 import traceback
+import requests
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, date as date_cls
 
@@ -28,9 +29,13 @@ from analysis import (
 PORT = int(os.environ.get("PORT", 10000))
 _lb_config = Config.from_apikey_env()
 
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 _subscribed: set[str] = set()
+_sent_alerts: set[str] = set()
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
@@ -46,6 +51,28 @@ def get_ctx() -> QuoteContext:
 def norm(symbol: str) -> str:
     s = symbol.strip().upper()
     return s if "." in s else f"{s}.US"
+
+
+def send_telegram_alert(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM] not configured", flush=True)
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 200:
+            print("[TELEGRAM] sent ok", flush=True)
+            return True
+        print(f"[TELEGRAM] error {r.status_code}: {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[TELEGRAM] error: {type(e).__name__}: {e}", flush=True)
+    return False
 
 
 def candles_to_df(candles):
@@ -81,9 +108,6 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     )
 
 
-# ============================================================
-# دوال مساعدة للخيارات
-# ============================================================
 def _strike_of(c):
     for attr in ("strike_price", "strike", "price"):
         v = getattr(c, attr, None)
@@ -113,9 +137,6 @@ def _put_of(c):
     return None
 
 
-# ============================================================
-# ✅ fetch_option_data — منطق OI كما في النسخة التي عملت + vol + whales
-# ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
     sym = norm(symbol)
@@ -164,7 +185,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         if not chain:
             return result
 
-        # اختيار العقد الرئيسي
         if direction == "bullish":
             target = price * 1.015
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
@@ -184,7 +204,6 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
 
         result["strike"] = f"{opt_type} {int(strike)}"
 
-        # سعر العقد الرئيسي
         try:
             oqs = ctx.option_quote([option_symbol])
             if oqs:
@@ -199,21 +218,31 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         except Exception:
             pass
 
-        # ============================================================
-        # ✅ منطق OI الأصلي (الذي عمل)
-        # ============================================================
+        base_match = re.match(r'^([A-Z]+)', sym.replace(".US", ""))
+        base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
+
         all_call_syms, all_put_syms = [], []
         for c in chain:
             cs = _call_of(c)
             ps = _put_of(c)
-            if cs: all_call_syms.append(cs)
-            if ps: all_put_syms.append(ps)
+            sk = _strike_of(c)
+
+            if cs:
+                all_call_syms.append(cs)
+            elif sk > 0:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                all_call_syms.append(f"{base_sym}{yy}{mm}{dd}C{str(int(sk * 1000))}.US")
+
+            if ps:
+                all_put_syms.append(ps)
+            elif sk > 0:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                all_put_syms.append(f"{base_sym}{yy}{mm}{dd}P{str(int(sk * 1000))}.US")
 
         qmap = {}
         all_syms = all_call_syms + all_put_syms
-        BATCH = 50
-        for i in range(0, len(all_syms), BATCH):
-            batch = all_syms[i:i + BATCH]
+        for i in range(0, len(all_syms), 30):
+            batch = all_syms[i:i + 30]
             try:
                 qs = ctx.option_quote(batch)
                 if qs:
@@ -240,21 +269,28 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         result["total_call_vol"] = total_call_vol
         result["total_put_vol"]  = total_put_vol
 
-        # 5 عقود قريبة للعرض
         nearby = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:5]
         call_data, put_data = [], []
         for c in nearby:
-            cs = _call_of(c)
-            ps = _put_of(c)
             sk = int(_strike_of(c))
-            if cs and cs in qmap:
+
+            cs = _call_of(c)
+            if not cs:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                cs = f"{base_sym}{yy}{mm}{dd}C{str(int(_strike_of(c) * 1000))}.US"
+            if cs in qmap:
                 q = qmap[cs]
                 call_data.append({
                     "strike": sk,
                     "oi": int(getattr(q, "open_interest", 0) or 0),
                     "volume": int(getattr(q, "volume", 0) or 0),
                 })
-            if ps and ps in qmap:
+
+            ps = _put_of(c)
+            if not ps:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                ps = f"{base_sym}{yy}{mm}{dd}P{str(int(_strike_of(c) * 1000))}.US"
+            if ps in qmap:
                 q = qmap[ps]
                 put_data.append({
                     "strike": sk,
@@ -267,15 +303,19 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
         result["call_oi"] = call_data
         result["put_oi"]  = put_data
 
-        # ============================================================
-        # 🐋 الحيتان — 10 عقود قريبة
-        # ============================================================
         whales = []
         wide = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:10]
         for c in wide:
-            cs = _call_of(c)
-            ps = _put_of(c)
             sk = int(_strike_of(c))
+            cs = _call_of(c)
+            if not cs:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                cs = f"{base_sym}{yy}{mm}{dd}C{str(int(_strike_of(c) * 1000))}.US"
+            ps = _put_of(c)
+            if not ps:
+                yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
+                ps = f"{base_sym}{yy}{mm}{dd}P{str(int(_strike_of(c) * 1000))}.US"
+
             for sym_opt, opt_type_w in ((cs, "CALL"), (ps, "PUT")):
                 if not sym_opt or sym_opt not in qmap:
                     continue
@@ -296,9 +336,7 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
                 whales.append({
                     "strike": sk, "type": opt_type_w,
                     "volume": vol, "oi": oi,
-                    "bid": round(bid, 2),
-                    "ask": round(ask, 2),
-                    "last": round(last, 2),
+                    "bid": round(bid, 2), "ask": round(ask, 2), "last": round(last, 2),
                     "direction": dir_w,
                 })
         whales.sort(key=lambda w: w["volume"], reverse=True)
@@ -446,9 +484,103 @@ def analyze_symbol(symbol: str) -> dict:
     }
 
 
-# ============================================================
-# app — أولاً
-# ============================================================
+def build_alert_message(data: dict) -> str:
+    sym = data["symbol"]
+    price = data["price"]
+    card = data.get("card", {})
+    lv = data.get("levels", {})
+    color = card.get("color", "gray")
+
+    if color == "green":
+        header = f"🟢 <b>إشارة CALL</b> — {sym}"
+    elif color == "red":
+        header = f"🔴 <b>إشارة PUT</b> — {sym}"
+    else:
+        return ""
+
+    return f"""{header}
+
+💪 قوة الإشارة: <b>{card.get('score', 0)}%</b>
+💰 السعر الحالي: <b>${price}</b>
+
+📋 <b>العقد المقترح:</b>
+  • STRIKE: <b>{lv.get('strike','—')}</b>
+  • EXPIRY: <b>{lv.get('expiry','—')}</b> (DTE: {lv.get('dte','—')})
+  • PREMIUM: <b>${lv.get('premium','—')}</b>
+
+📊 <b>المستويات:</b>
+  • ENTRY: ${lv.get('entry','—')}
+  • STOP: ${lv.get('stop','—')}
+  • TARGET 1: ${lv.get('target1','—')}
+  • TARGET 2: ${lv.get('target2','—')}
+
+⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+"""
+
+
+WATCHLIST_FILE = "watchlist.json"
+
+
+def get_watchlist() -> list:
+    import json
+    try:
+        if os.path.exists(WATCHLIST_FILE):
+            with open(WATCHLIST_FILE, "r") as f:
+                data = json.load(f)
+                return [s.upper() for s in data.get("symbols", [])]
+    except Exception:
+        pass
+    return ["AAPL", "NVDA", "TSLA", "META", "AMD", "MSFT", "GOOGL", "AMZN"]
+
+
+def save_watchlist(symbols: list):
+    import json
+    try:
+        with open(WATCHLIST_FILE, "w") as f:
+            json.dump({"symbols": [s.upper() for s in symbols]}, f)
+    except Exception:
+        pass
+
+
+async def watchlist_checker():
+    global _sent_alerts
+    await asyncio.sleep(60)
+
+    while True:
+        try:
+            watchlist = get_watchlist()
+            print(f"[WATCH] checking {len(watchlist)} symbols...", flush=True)
+
+            for sym in watchlist:
+                try:
+                    data = await asyncio.to_thread(analyze_symbol, sym)
+                    card = data.get("card", {})
+                    color = card.get("color", "gray")
+
+                    if color not in ("green", "red"):
+                        continue
+
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    alert_key = f"{sym}:{color}:{today}"
+
+                    if alert_key in _sent_alerts:
+                        continue
+
+                    msg = build_alert_message(data)
+                    if msg:
+                        await asyncio.to_thread(send_telegram_alert, msg)
+                        _sent_alerts.add(alert_key)
+                        print(f"[WATCH] alert sent for {sym} ({color})", flush=True)
+
+                except Exception as e:
+                    print(f"[WATCH] {sym} error: {e}", flush=True)
+
+        except Exception as e:
+            print(f"[WATCH] fatal: {e}", flush=True)
+
+        await asyncio.sleep(300)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _event_loop
@@ -461,6 +593,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[STARTUP] error: {e}", flush=True)
 
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            send_telegram_alert("🚀 <b>محلل الأسهم</b> — تم تشغيل النظام بنجاح")
+        except Exception:
+            pass
+
     async def keepalive_task():
         while True:
             await asyncio.sleep(300)
@@ -469,9 +607,13 @@ async def lifespan(app: FastAPI):
             except Exception:
                 pass
 
-    task = asyncio.create_task(keepalive_task())
+    keepalive = asyncio.create_task(keepalive_task())
+    watcher = asyncio.create_task(watchlist_checker())
+
     yield
-    task.cancel()
+
+    keepalive.cancel()
+    watcher.cancel()
     global _quote_ctx
     _quote_ctx = None
 
@@ -486,9 +628,6 @@ app.add_middleware(
 )
 
 
-# ============================================================
-# endpoints
-# ============================================================
 @app.get("/api/status")
 def status(symbol: str = Query("AAPL")):
     try:
@@ -506,6 +645,26 @@ def health():
     return {"status": "healthy"}
 
 
+@app.get("/api/test-telegram")
+def test_telegram():
+    ok = send_telegram_alert("✅ <b>اختبار ناجح</b>\nإذا وصلتك هذه الرسالة، فالتنبيهات تعمل.")
+    return {"sent": ok, "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
+
+
+@app.get("/api/watchlist")
+def get_wl():
+    return {"symbols": get_watchlist()}
+
+
+@app.post("/api/watchlist")
+async def update_wl(payload: dict):
+    symbols = payload.get("symbols", [])
+    if not isinstance(symbols, list):
+        return JSONResponse(status_code=400, content={"error": "symbols must be list"})
+    save_watchlist(symbols)
+    return {"ok": True, "symbols": get_watchlist()}
+
+
 @app.get("/api/analyze/{symbol}")
 def analyze(symbol: str):
     try:
@@ -517,7 +676,6 @@ def analyze(symbol: str):
         })
 
 
-# ✅ endpoint خفيف — يستدعي fetch_option_data فقط (بدون تحليل كامل)
 @app.get("/api/options/{symbol}")
 def options_live(symbol: str):
     try:
@@ -525,8 +683,6 @@ def options_live(symbol: str):
         sym = norm(symbol)
         q = ctx.quote([sym])
         price = float(q[0].last_done) if q else 0.0
-
-        # نستخدم "daily" لأننا نحتاج فقط OI/Vol — العقد الرئيسي لا يهم هنا
         opt = fetch_option_data(symbol, "bullish", price, "daily")
         return {
             "expiry":         opt.get("expiry", "—"),
@@ -549,38 +705,24 @@ def price_only(symbol: str):
     try:
         ctx = get_ctx()
         sym = norm(symbol)
-
         try:
-            candles = ctx.candlesticks(
-                sym, Period.Min_1, 1,
-                AdjustType.NoAdjust,
-                trade_sessions=TradeSessions.All,
-            )
+            candles = ctx.candlesticks(sym, Period.Min_1, 1, AdjustType.NoAdjust,
+                                       trade_sessions=TradeSessions.All)
             if candles:
                 last = candles[-1]
-                return {
-                    "symbol": symbol.upper(),
-                    "price": float(last.close),
-                    "open": float(last.open),
-                    "high": float(last.high),
-                    "low": float(last.low),
-                    "volume": int(last.volume),
-                    "timestamp": last.timestamp.isoformat(),
-                }
+                return {"symbol": symbol.upper(), "price": float(last.close),
+                        "open": float(last.open), "high": float(last.high),
+                        "low": float(last.low), "volume": int(last.volume),
+                        "timestamp": last.timestamp.isoformat()}
         except Exception:
             pass
 
         q = ctx.quote([sym])
         if q:
-            return {
-                "symbol": symbol.upper(),
-                "price": float(q[0].last_done),
-                "open": float(q[0].open),
-                "high": float(q[0].high),
-                "low": float(q[0].low),
-                "volume": int(q[0].volume),
-                "timestamp": q[0].timestamp.isoformat(),
-            }
+            return {"symbol": symbol.upper(), "price": float(q[0].last_done),
+                    "open": float(q[0].open), "high": float(q[0].high),
+                    "low": float(q[0].low), "volume": int(q[0].volume),
+                    "timestamp": q[0].timestamp.isoformat()}
         return JSONResponse(status_code=404, content={"error": "no data"})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
@@ -613,10 +755,7 @@ def _on_quote(symbol: str, event: PushQuote):
     global _event_loop
     if _event_loop is None:
         return
-    msg = {
-        "symbol": symbol.replace(".US", ""),
-        "price":  float(event.last_done),
-    }
+    msg = {"symbol": symbol.replace(".US", ""), "price": float(event.last_done)}
     try:
         asyncio.run_coroutine_threadsafe(
             manager.broadcast(symbol.replace(".US", ""), msg),
@@ -631,7 +770,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
     symbol = symbol.upper()
     await manager.connect(symbol, ws)
     sym_us = norm(symbol)
-
     if sym_us not in _subscribed:
         try:
             ctx = get_ctx()
@@ -639,7 +777,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
             _subscribed.add(sym_us)
         except Exception:
             pass
-
     try:
         while True:
             await asyncio.wait_for(ws.receive_text(), timeout=90)
