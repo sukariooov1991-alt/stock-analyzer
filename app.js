@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final (دمج ذكي — لا يفقد البيانات عند التحديث)
+   app.js — Final (تحديث فوري بعد F5)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -86,7 +86,6 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -116,7 +115,6 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== الحيتان ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -177,7 +175,6 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
-/* ===== مربعات CALL/PUT ===== */
 function updatePutCallBoxes(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
@@ -189,7 +186,6 @@ function updatePutCallBoxes(root, sym, card) {
   const totOI = tCOI + tPOI;
   const totV  = tCV + tPV;
 
-  // إذا لا بيانات — نعرض "—" بدل 50/50
   const callOITxt  = totOI > 0 ? Math.round(tCOI / totOI * 100) + "%" : "—";
   const putOITxt   = totOI > 0 ? Math.round(tPOI / totOI * 100) + "%" : "—";
   const callVolTxt = totV  > 0 ? Math.round(tCV  / totV  * 100) + "%" : "—";
@@ -217,7 +213,6 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== الشريط السفلي ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -250,7 +245,6 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-/* ===== بناء البطاقة ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -366,7 +360,6 @@ function buildCard(cardData) {
   return div;
 }
 
-/* ===== التحديث داخل المكان ===== */
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
   const sym = data.symbol;
@@ -419,7 +412,6 @@ function updateCardInPlace(cardEl, data) {
   checkSound(sym, c.color);
 }
 
-/* ===== ✅ الدمج الذكي — لا يمسح البيانات عند التحديث ===== */
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
@@ -427,7 +419,7 @@ function rebuildCard(symbol, newData) {
   const oldCard = cards[idx];
   const merged = { ...newData };
 
-  // ✅ احتفظ ببيانات OI القديمة إذا الجديدة فارغة
+  // ✅ لا نمسح البيانات إذا الجديدة فارغة
   if (!newData.call_oi || newData.call_oi.length === 0) {
     merged.call_oi = oldCard.call_oi || [];
   }
@@ -438,7 +430,6 @@ function rebuildCard(symbol, newData) {
     merged.whales = oldCard.whales || [];
   }
 
-  // ✅ احتفظ بالإجماليات إذا الجديدة صفر
   if ((newData.total_call_oi || 0) === 0 && (oldCard.total_call_oi || 0) > 0) {
     merged.total_call_oi = oldCard.total_call_oi;
   }
@@ -456,6 +447,9 @@ function rebuildCard(symbol, newData) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
   updateCardInPlace(cardEl, merged);
+
+  // ✅ احفظ في localStorage بعد كل تحديث
+  saveCards();
 }
 
 function renderCards() {
@@ -582,13 +576,23 @@ searchForm.addEventListener("submit", (e) => {
   symbolInput.blur();
 });
 
+/* ============================================================
+   ✅ التهيئة — تحديث فوري بعد F5
+   ============================================================ */
 (function init() {
   cards = loadCards();
   renderCards();
+
   cards.forEach(c => {
     connectLive(c.symbol);
     startStatePolling(c.symbol);
   });
+
+  // ✅ التحديث الفوري لكل بطاقة (بعد ثانيتين من تحميل الصفحة)
+  setTimeout(() => {
+    cards.forEach(c => fetchState(c.symbol));
+  }, 2000);
+
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
   setTimeout(pollPrices, 3000);
