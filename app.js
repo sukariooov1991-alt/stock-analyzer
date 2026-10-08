@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Smooth Updates (بدون وميض + تجاهل الردود الفارغة)
+   app.js — Final
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -78,7 +78,6 @@ function buildOIBlockStatic(title, kind, color) {
   `;
 }
 
-/* ===== تحديث OI Block — بدون إعادة بناء ===== */
 function updateOIBlockData(root, kind, data) {
   if (!root) return;
   data = data || [];
@@ -98,7 +97,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== الحيتان — 5 صفوف ثابتة ===== */
+/* ===== الحيتان ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -195,7 +194,6 @@ function updatePutCallBars(root, sym, card) {
   if (callVolFill) callVolFill.style.width = `${callVolPct}%`;
 }
 
-/* ===== تحديث كل العناصر الديناميكية ===== */
 function updateAllDynamic(root, sym, card) {
   if (!root || !card) return;
   const callOI = card.call_oi || [];
@@ -210,7 +208,6 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== بناء البطاقة ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -320,7 +317,6 @@ function buildCard(cardData) {
 
   div.innerHTML = row1 + row2 + row3 + expanded;
 
-  // ملء البيانات الديناميكية مبدئياً
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
@@ -413,28 +409,20 @@ function updateCardPrice(symbol, price) {
   }
 }
 
-/* ✅ تحديث الخيارات — بدون مسح + يتجاهل الردود الفارغة */
+/* ✅ التحديث الحساس — لا يستبدل قيمة صحيحة بقيمة فارغة */
 function updateCardOptions(symbol, opt) {
   const card = cards.find(c => c.symbol === symbol);
   if (!card) return;
 
-  // تحقق من صحة الرد
-  const hasValidOI  = (opt.total_call_oi || 0) + (opt.total_put_oi || 0) > 0;
-  const hasValidArr = (opt.call_oi && opt.call_oi.length > 0)
-                   || (opt.put_oi  && opt.put_oi.length  > 0);
+  // لا تستبدل قيمة صحيحة بقيمة صفر أو فارغة
+  if ((opt.total_call_oi  || 0) > 0) card.total_call_oi  = opt.total_call_oi;
+  if ((opt.total_put_oi   || 0) > 0) card.total_put_oi   = opt.total_put_oi;
+  if ((opt.total_call_vol || 0) > 0) card.total_call_vol = opt.total_call_vol;
+  if ((opt.total_put_vol  || 0) > 0) card.total_put_vol  = opt.total_put_vol;
 
-  if (!hasValidOI || !hasValidArr) {
-    console.warn(`[options] empty response for ${symbol} — keeping old data`);
-    return;
-  }
-
-  card.total_call_oi  = opt.total_call_oi;
-  card.total_put_oi   = opt.total_put_oi;
-  card.total_call_vol = opt.total_call_vol || 0;
-  card.total_put_vol  = opt.total_put_vol  || 0;
-  card.call_oi = opt.call_oi || [];
-  card.put_oi  = opt.put_oi  || [];
-  card.whales  = opt.whales  || [];
+  if (opt.call_oi && opt.call_oi.length > 0) card.call_oi = opt.call_oi;
+  if (opt.put_oi  && opt.put_oi.length  > 0) card.put_oi  = opt.put_oi;
+  if (opt.whales  && opt.whales.length  > 0) card.whales  = opt.whales;
 
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
@@ -443,7 +431,6 @@ function updateCardOptions(symbol, opt) {
   updateAllDynamic(cardEl, symbol, card);
 }
 
-/* ✅ جلب الخيارات — لا يحدّث البطاقات المغلقة */
 async function fetchCardOptions(symbol) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (cardEl && !cardEl.classList.contains("open")) return;
