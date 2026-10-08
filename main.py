@@ -132,7 +132,8 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         if not raw_dates: return result
         today = datetime.now(timezone.utc).date()
-        target_dte = 52 if strategy == "weekly" else 37
+        # ✅ التعديل: target_dte = 37 دائماً
+        target_dte = 37
         parsed = []
         for d in raw_dates:
             if isinstance(d, date_cls):
