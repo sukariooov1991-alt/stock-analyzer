@@ -71,7 +71,6 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
     period = PERIOD_MAP.get(timeframe.lower())
     if period is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
-    # ✅ كل الجلسات (pre + regular + after + overnight)
     return ctx.candlesticks(
         norm(symbol), period, count,
         AdjustType.NoAdjust,
@@ -80,7 +79,7 @@ def fetch_candles(symbol: str, timeframe: str, count: int = 300):
 
 
 # ============================================================
-# fetch_option_data — نسخة تشخيصية شاملة
+# ✅ fetch_option_data — النسخة الصحيحة
 # ============================================================
 def fetch_option_data(symbol: str, direction: str, price: float, strategy: str = "daily") -> dict:
     ctx = get_ctx()
@@ -96,9 +95,10 @@ def fetch_option_data(symbol: str, direction: str, price: float, strategy: str =
     def log(m):
         result["_debug"].append(str(m))
 
-    # ===== 1) تواريخ الانتهاء =====
+    # ===== 1) تواريخ الانتهاء — الدالة الصحيحة =====
     try:
-        raw_dates = ctx.option_chain_info_by_date(sym)
+        # ✅ الدالة الصحيحة للحصول على قائمة التواريخ
+        raw_dates = ctx.option_chain_expiry_date_list(sym)
         log(f"1. dates type={type(raw_dates).__name__} len={len(raw_dates) if raw_dates else 0}")
         if raw_dates:
             log(f"   sample={[str(x) for x in raw_dates[:3]]}")
@@ -561,7 +561,6 @@ async def ws_endpoint(ws: WebSocket, symbol: str):
         try:
             ctx = get_ctx()
             ctx.set_on_quote(_on_quote)
-            # ✅ كل الجلسات (overnight + pre + regular + after)
             ctx.subscribe(
                 [sym_us],
                 [SubType.Quote],
