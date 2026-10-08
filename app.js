@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — RSI+MACD Swing (Strategy مدمج في الشريط السفلي)
+   app.js — Final (كبسولات الحيتان + شريط مدمج مرتب)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -88,6 +88,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
+/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -117,14 +118,20 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
+/* ===== الحيتان — كبسولات ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
-    rows += `<div class="whale-row" data-whale-row="${sym}-${i}" style="display:none;">
-      <div class="whale-strike" data-whale-strike="${sym}-${i}">—</div>
-      <div class="whale-vol" data-whale-vol="${sym}-${i}">Vol: <b>—</b></div>
-      <div class="whale-oi" data-whale-oi="${sym}-${i}">OI: <b>—</b></div>
-      <div class="whale-dir" data-whale-dir="${sym}-${i}">—</div>
+    rows += `<div class="whale-pill" data-whale-row="${sym}-${i}" style="display:none;">
+      <span class="whale-type" data-whale-type="${sym}-${i}">—</span>
+      <span class="whale-sep">·</span>
+      <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span>
+      <span class="whale-sep">·</span>
+      <span class="whale-vol">Vol <b data-whale-vol="${sym}-${i}">—</b></span>
+      <span class="whale-sep">·</span>
+      <span class="whale-oi">OI <b data-whale-oi="${sym}-${i}">—</b></span>
+      <span class="whale-sep">·</span>
+      <span class="whale-dir" data-whale-dir="${sym}-${i}">—</span>
     </div>`;
   }
   return `<div class="whales-section" id="whales-${sym}" style="display:none;">
@@ -140,22 +147,29 @@ function updateWhalesData(root, sym, whales) {
   whales = whales || [];
   if (whales.length === 0) { wrap.style.display = "none"; return; }
   wrap.style.display = "block";
+
   for (let i = 0; i < 5; i++) {
     const row = root.querySelector(`[data-whale-row="${sym}-${i}"]`);
     if (!row) continue;
+
     if (i < whales.length) {
       const w = whales[i];
-      row.style.display = "grid";
-      row.className = "whale-row " + (w.type === "CALL" ? "whale-call" : "whale-put");
+      row.style.display = "inline-flex";
+      row.className = "whale-pill " + (w.type === "CALL" ? "whale-call" : "whale-put");
+
+      const type = row.querySelector(`[data-whale-type="${sym}-${i}"]`);
       const strike = row.querySelector(`[data-whale-strike="${sym}-${i}"]`);
       const vol = row.querySelector(`[data-whale-vol="${sym}-${i}"]`);
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
-      if (strike) strike.textContent = `${w.type} ${w.strike}`;
+
+      if (type) type.textContent = w.type;
+      if (strike) strike.textContent = w.strike;
+
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
       const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
-      if (vol) vol.innerHTML = `Vol: <b>${volFmt}</b>`;
-      if (oi)  oi.innerHTML  = `OI: <b>${oiFmt}</b>`;
+      if (vol) vol.textContent = volFmt;
+      if (oi)  oi.textContent  = oiFmt;
       if (dir) dir.textContent = w.direction === "buy" ? "🟢 يشتري"
                               : w.direction === "sell" ? "🔴 يبيع"
                               : "⚪ محايد";
@@ -207,7 +221,7 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ✅ الشريط السفلي المدمج — كل تفاصيل الاستراتيجية هنا */
+/* ✅ الشريط المدمج — صف واحد مرتب */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -232,16 +246,14 @@ function buildSummaryBar(cardData) {
 
   return `
     <div class="summary-bar">
-      <div class="summary-badge badge-${color}">${label}</div>
-      <div class="summary-metrics">
-        <span class="metric"><span class="mlabel">MACD</span> <b>${macd}</b> ${macdIcon}</span>
-        <span class="sep">·</span>
-        <span class="metric"><span class="mlabel">RSI</span> <b>${rsi}</b> ${rsiIcon}</span>
-        <span class="sep">·</span>
-        <span class="metric"><span class="mlabel">ADX</span> <b>${adx}</b> ${adxIcon}</span>
-        <span class="sep">·</span>
-        <span class="metric"><span class="mlabel">VOL</span> ${volIcon}</span>
-      </div>
+      <span class="summary-badge badge-${color}">${label}</span>
+      <span class="summary-item">MACD <b>${macd}</b> ${macdIcon}</span>
+      <span class="summary-sep">·</span>
+      <span class="summary-item">RSI <b>${rsi}</b> ${rsiIcon}</span>
+      <span class="summary-sep">·</span>
+      <span class="summary-item">ADX <b>${adx}</b> ${adxIcon}</span>
+      <span class="summary-sep">·</span>
+      <span class="summary-item">VOL ${volIcon}</span>
     </div>
   `;
 }
@@ -258,6 +270,7 @@ function buildCard(cardData) {
   const div = document.createElement("div");
   div.className = "card " + cls;
   div.dataset.symbol = sym;
+  if (window._skipCardAnim) div.style.animation = "none";
 
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
@@ -416,6 +429,7 @@ function updateCardPrice(symbol, price) {
   }
 }
 
+/* ✅ تحديث ذكي — بدون وميض */
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
@@ -425,12 +439,13 @@ function rebuildCard(symbol, newData) {
   const oldEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (oldEl) {
     const wasOpen = oldEl.classList.contains("open");
+    window._skipCardAnim = true;
     const newEl = buildCard(newData);
     if (wasOpen) newEl.classList.add("open");
     oldEl.replaceWith(newEl);
+    window._skipCardAnim = false;
   }
   checkSound(symbol, newColor);
-  renderCards();
 }
 
 async function fetchState(symbol) {
