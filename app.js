@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final (تعريب المصطلحات + بدون وميض + مربعات CALL/PUT)
+   app.js — Final (دمج ذكي — لا يفقد البيانات عند التحديث)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -187,21 +187,22 @@ function updatePutCallBoxes(root, sym, card) {
   const tPV  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
 
   const totOI = tCOI + tPOI;
-  let callOIPct = 50, putOIPct = 50;
-  if (totOI > 0) { callOIPct = Math.round(tCOI / totOI * 100); putOIPct = 100 - callOIPct; }
+  const totV  = tCV + tPV;
 
-  const totV = tCV + tPV;
-  let callVolPct = 50, putVolPct = 50;
-  if (totV > 0) { callVolPct = Math.round(tCV / totV * 100); putVolPct = 100 - callVolPct; }
+  // إذا لا بيانات — نعرض "—" بدل 50/50
+  const callOITxt  = totOI > 0 ? Math.round(tCOI / totOI * 100) + "%" : "—";
+  const putOITxt   = totOI > 0 ? Math.round(tPOI / totOI * 100) + "%" : "—";
+  const callVolTxt = totV  > 0 ? Math.round(tCV  / totV  * 100) + "%" : "—";
+  const putVolTxt  = totV  > 0 ? Math.round(tPV  / totV  * 100) + "%" : "—";
 
-  const setPct = (id, val) => {
+  const set = (id, val) => {
     const el = root.querySelector(`#${id}-${sym}`);
-    if (el) el.textContent = val + "%";
+    if (el) el.textContent = val;
   };
-  setPct("pcbox-call-oi",  callOIPct);
-  setPct("pcbox-put-oi",   putOIPct);
-  setPct("pcbox-call-vol", callVolPct);
-  setPct("pcbox-put-vol",  putVolPct);
+  set("pcbox-call-oi",  callOITxt);
+  set("pcbox-put-oi",   putOITxt);
+  set("pcbox-call-vol", callVolTxt);
+  set("pcbox-put-vol",  putVolTxt);
 }
 
 function updateAllDynamic(root, sym, card) {
@@ -216,7 +217,7 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== الشريط السفلي المدمج ===== */
+/* ===== الشريط السفلي ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -319,19 +320,19 @@ function buildCard(cardData) {
     <div class="putcall-boxes">
       <div class="pcbox pcbox-call">
         <div class="pcbox-label">مفتوحة - شراء</div>
-        <div class="pcbox-pct" id="pcbox-call-oi-${sym}">50%</div>
+        <div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-put">
         <div class="pcbox-label">مفتوحة - بيع</div>
-        <div class="pcbox-pct" id="pcbox-put-oi-${sym}">50%</div>
+        <div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-call">
         <div class="pcbox-label">حجم - شراء</div>
-        <div class="pcbox-pct" id="pcbox-call-vol-${sym}">50%</div>
+        <div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-put">
         <div class="pcbox-label">حجم - بيع</div>
-        <div class="pcbox-pct" id="pcbox-put-vol-${sym}">50%</div>
+        <div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div>
       </div>
     </div>`;
 
@@ -365,15 +366,13 @@ function buildCard(cardData) {
   return div;
 }
 
-/* ===== التحديث داخل المكان (بدون إعادة بناء) ===== */
-function updateCardInPlace(cardEl, newData) {
-  const c = newData.card || {};
-  const sym = newData.symbol;
-  const price = newData.price ?? 0;
+/* ===== التحديث داخل المكان ===== */
+function updateCardInPlace(cardEl, data) {
+  const c = data.card || {};
+  const sym = data.symbol;
+  const price = data.price ?? 0;
 
-  // ✅ احفظ حالة الفتح
   const wasOpen = cardEl.classList.contains("open");
-
   cardEl.className = "card " + (c.color || "gray");
   if (wasOpen) cardEl.classList.add("open");
 
@@ -388,7 +387,7 @@ function updateCardInPlace(cardEl, newData) {
   const btmPrice = cardEl.querySelector("[data-btm-price]");
   if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
 
-  const tfs = newData.timeframes || [];
+  const tfs = data.timeframes || [];
   tfs.forEach((t, idx) => {
     const cell = cardEl.querySelector(`[data-tf-cell="${idx}"]`);
     if (!cell) return;
@@ -406,18 +405,57 @@ function updateCardInPlace(cardEl, newData) {
   });
 
   const vwapEl = cardEl.querySelector("[data-btm-vwap]");
-  if (vwapEl) vwapEl.textContent = "$" + (newData.vwap ?? "—");
+  if (vwapEl) vwapEl.textContent = "$" + (data.vwap ?? "—");
   const resEl = cardEl.querySelector("[data-btm-res]");
-  if (resEl) resEl.textContent = (newData.resistances || []).join(" / ") || "—";
+  if (resEl) resEl.textContent = (data.resistances || []).join(" / ") || "—";
   const supEl = cardEl.querySelector("[data-btm-sup]");
-  if (supEl) supEl.textContent = (newData.supports || []).join(" / ") || "—";
+  if (supEl) supEl.textContent = (data.supports || []).join(" / ") || "—";
 
-  updateAllDynamic(cardEl, sym, newData);
+  updateAllDynamic(cardEl, sym, data);
 
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
-  if (sumWrap) sumWrap.innerHTML = buildSummaryBar(newData);
+  if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
 
   checkSound(sym, c.color);
+}
+
+/* ===== ✅ الدمج الذكي — لا يمسح البيانات عند التحديث ===== */
+function rebuildCard(symbol, newData) {
+  const idx = cards.findIndex(c => c.symbol === symbol);
+  if (idx === -1) return;
+
+  const oldCard = cards[idx];
+  const merged = { ...newData };
+
+  // ✅ احتفظ ببيانات OI القديمة إذا الجديدة فارغة
+  if (!newData.call_oi || newData.call_oi.length === 0) {
+    merged.call_oi = oldCard.call_oi || [];
+  }
+  if (!newData.put_oi || newData.put_oi.length === 0) {
+    merged.put_oi = oldCard.put_oi || [];
+  }
+  if (!newData.whales || newData.whales.length === 0) {
+    merged.whales = oldCard.whales || [];
+  }
+
+  // ✅ احتفظ بالإجماليات إذا الجديدة صفر
+  if ((newData.total_call_oi || 0) === 0 && (oldCard.total_call_oi || 0) > 0) {
+    merged.total_call_oi = oldCard.total_call_oi;
+  }
+  if ((newData.total_put_oi || 0) === 0 && (oldCard.total_put_oi || 0) > 0) {
+    merged.total_put_oi = oldCard.total_put_oi;
+  }
+  if ((newData.total_call_vol || 0) === 0 && (oldCard.total_call_vol || 0) > 0) {
+    merged.total_call_vol = oldCard.total_call_vol;
+  }
+  if ((newData.total_put_vol || 0) === 0 && (oldCard.total_put_vol || 0) > 0) {
+    merged.total_put_vol = oldCard.total_put_vol;
+  }
+
+  cards[idx] = merged;
+  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!cardEl) return;
+  updateCardInPlace(cardEl, merged);
 }
 
 function renderCards() {
@@ -482,15 +520,6 @@ function updateCardPrice(symbol, price) {
     const btmPrice = cardEl.querySelector("[data-btm-price]");
     if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
   }
-}
-
-function rebuildCard(symbol, newData) {
-  const idx = cards.findIndex(c => c.symbol === symbol);
-  if (idx === -1) return;
-  cards[idx] = newData;
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (!cardEl) return;
-  updateCardInPlace(cardEl, newData);
 }
 
 async function fetchState(symbol) {
