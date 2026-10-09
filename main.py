@@ -127,9 +127,6 @@ def _put_of(c):
 
 
 def fetch_option_data(symbol, direction, price, strategy="swing"):
-    """
-    strategy = "swing" → DTE 7-15 يوم (حسب المواصفة الجديدة)
-    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = {"strike":"—","expiry":"—","dte":"—","premium":"—","delta":None,
@@ -139,7 +136,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         if not raw_dates: return result
         today = datetime.now(timezone.utc).date()
-        # ✅ DTE 7-15 يوم (نستهدف 10 أيام)
         target_dte = 10
         parsed = []
         for d in raw_dates:
@@ -151,10 +147,8 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     if dd > today: parsed.append(dd)
                 except Exception: continue
 
-        # ✅ فلتر: نبحث عن تواريخ بين 5 و 20 يوم
         valid = [(d, (d - today).days) for d in parsed if 5 <= (d - today).days <= 20]
         if not valid:
-            # إذا لم يوجد، نختار الأقرب
             valid = [(d, (d - today).days) for d in parsed]
         if not valid:
             return result
@@ -177,7 +171,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         def build_put_sym(sk):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
-        # اختيار العقد الرئيسي — Delta 0.40-0.55 (قريب من السعر)
         if direction == "bullish":
             target = price * 1.005
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
@@ -293,7 +286,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# ✅ analyze_symbol — الاستراتيجية الجديدة
+# analyze_symbol — الاستراتيجية الجديدة
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 200))
@@ -301,7 +294,6 @@ def analyze_symbol(symbol: str) -> dict:
     df_4h     = candles_to_df(fetch_candles(symbol, "4h", 300))
     df_1h     = candles_to_df(fetch_candles(symbol, "1h", 300))
 
-    # enrich بالـ EMA/ATR وغيرها
     def enrich(df):
         df["ema20"] = ema(df["close"], 20)
         df["ema50"] = ema(df["close"], 50)
@@ -316,41 +308,77 @@ def analyze_symbol(symbol: str) -> dict:
     df_4h     = enrich(df_4h)
     df_1h     = enrich(df_1h)
 
-    # السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    # ✅ تشغيل الماسح الجديد
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
-    # بناء البطاقة
+    # ✅ RVOL احتياطي متعدد الفريمات
+    rv_1h = rvol(df_1h, 20)
+    rv_4h = rvol(df_4h, 20)
+    rv_1d = rvol(df_daily, 20)
+
+    rv_final = rv_1h
+    rv_source = "1H"
+    if rv_1h < 0.5:
+        if rv_4h >= 1.0:
+            rv_final = rv_4h; rv_source = "4H"
+        elif rv_1d >= 1.0:
+            rv_final = rv_1d; rv_source = "1D"
+        else:
+            rv_final = max(rv_1h, rv_4h, rv_1d)
+            rv_source = "max"
+
+    # ✅ إعادة حساب النقاط مع RVOL الجديد
+    scan["rvol"] = round(rv_final, 2)
+    scan["rvol_source"] = rv_source
+    scan["score"] = calculate_score(
+        trend_w=scan["trend_w"]["status"],
+        trend_d=scan["trend_d"]["status"],
+        trend_4h=scan["trend_4h"]["status"],
+        sweep=scan.get("sweep"),
+        fvg=scan.get("fvg"),
+        confirmed=scan["sequence"].get("confirm_index") is not None,
+        rvol_val=rv_final,
+    )
+
+    # ✅ إعادة تصنيف البطاقة
+    setup_for_classify = {
+        "sequence_found": scan["sequence"]["found"],
+        "trend_w": scan["trend_w"]["status"],
+        "direction": scan["direction"],
+        "score": scan["score"],
+        "rr": scan["levels"].get("rr", 0),
+    }
+    card_new = classify_setup(setup_for_classify)
+
     card = {
-        "color":  scan["color"],
-        "label":  scan["label"],
+        "color":  card_new["color"],
+        "label":  card_new["label"],
         "score":  scan["score"],
-        "status": scan["status"],
+        "status": card_new["status"],
         "trend_w":  scan["trend_w"]["status"],
         "trend_d":  scan["trend_d"]["status"],
         "trend_4h": scan["trend_4h"]["status"],
         "rvol":     scan["rvol"],
+        "rvol_source": rv_source,
         "sweep":    bool(scan.get("sweep")),
         "fvg":      bool(scan.get("fvg")),
         "rr":       scan["levels"].get("rr", 0),
     }
 
-    # الاتجاه المختار (CALL أو PUT أو لا شيء)
     direction = scan["direction"] or "bullish"
-
-    # المستويات
     levels = scan["levels"]
 
-    # الفريمات للعرض
-    def tf_snap(df, label):
+    # ✅ الفريمات — تعرض الحالة الحقيقية (up/down/neutral)
+    def tf_snap(df, label, use_ema200=False):
+        ts = trend_status(df, use_ema200=use_ema200)
         r = df.iloc[-1]
-        up = float(r["ema20"]) > float(r["ema50"])
         return {
-            "label": label, "trend": "up" if up else "down",
+            "label": label,
+            "trend": ts["status"],   # up / down / neutral
+            "reason": ts["reason"],
             "ema20": round(float(r["ema20"]), 2),
             "ema50": round(float(r["ema50"]), 2),
             "rsi":   round(float(r["rsi"]), 1),
@@ -359,20 +387,18 @@ def analyze_symbol(symbol: str) -> dict:
         }
 
     timeframes = [
-        tf_snap(df_weekly, "1W"),
-        tf_snap(df_daily,  "1D"),
-        tf_snap(df_4h,     "4H"),
-        tf_snap(df_1h,     "1H"),
+        tf_snap(df_weekly, "1W", use_ema200=False),
+        tf_snap(df_daily,  "1D", use_ema200=True),
+        tf_snap(df_4h,     "4H", use_ema200=False),
+        tf_snap(df_1h,     "1H", use_ema200=False),
     ]
 
-    # بيانات العقد
     opt = fetch_option_data(symbol, direction, price, "swing")
     levels["strike"]  = opt.get("strike", "—")
     levels["expiry"]  = opt.get("expiry", "—")
     levels["dte"]     = opt.get("dte", "—")
     levels["premium"] = opt.get("premium", "—")
 
-    # الدعم والمقاومة للعرض
     supports = [
         round(float(df_daily["low"].iloc[-20:].min()), 2),
         round(float(df_weekly["low"].iloc[-4:].min()), 2),
