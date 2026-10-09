@@ -27,6 +27,13 @@ const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
 
+/* ✅ ترجمة حالة الاتجاه */
+function trendLabel(t) {
+  if (t === "up") return "صاعد ↑";
+  if (t === "down") return "هابط ↓";
+  return "محايد —";
+}
+
 function playAlertSound(type) {
   try {
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -159,7 +166,7 @@ function updateWhalesData(root, sym, whales) {
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
 
-      if (type) type.textContent = w.type;   // CALL / PUT كما هو
+      if (type) type.textContent = w.type;
       if (strike) strike.textContent = w.strike;
 
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
@@ -298,7 +305,7 @@ function buildCard(cardData) {
   const tfs = cardData.timeframes || [];
   const tfsHtml = tfs.map((t, idx) => `
     <div class="tf-cell ${t.trend}" data-tf-cell="${idx}">
-      <div class="tf-label"><span>${t.label}</span><span data-tf-trend>${t.trend === "up" ? "صاعد ↑" : "هابط ↓"}</span></div>
+      <div class="tf-label"><span>${t.label}</span><span data-tf-trend>${trendLabel(t.trend)}</span></div>
       <div class="tf-row"><span>EMA</span><span class="v" data-tf-ema>${t.ema20}/${t.ema50}</span></div>
       <div class="tf-row"><span>RSI</span><span class="v" data-tf-rsi>${t.rsi}</span></div>
       <div class="tf-row"><span>ADX</span><span class="v" data-tf-adx>${t.adx}</span></div>
@@ -383,7 +390,6 @@ function updateCardInPlace(cardEl, data) {
   const btmPrice = cardEl.querySelector("[data-btm-price]");
   if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
 
-  // ✅ Row 2 + Row 3 — المستويات
   const row2 = cardEl.querySelector(".row-2");
   if (row2) {
     const cells = row2.querySelectorAll(".cell .val");
@@ -408,7 +414,7 @@ function updateCardInPlace(cardEl, data) {
     if (!cell) return;
     cell.className = "tf-cell " + t.trend;
     const trendEl = cell.querySelector("[data-tf-trend]");
-    if (trendEl) trendEl.textContent = t.trend === "up" ? "صاعد ↑" : "هابط ↓";
+    if (trendEl) trendEl.textContent = trendLabel(t.trend);
     const emaEl = cell.querySelector("[data-tf-ema]");
     if (emaEl) emaEl.textContent = `${t.ema20}/${t.ema50}`;
     const rsiEl = cell.querySelector("[data-tf-rsi]");
