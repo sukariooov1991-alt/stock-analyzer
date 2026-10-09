@@ -286,7 +286,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
 
 # ============================================================
-# analyze_symbol — الاستراتيجية الجديدة
+# analyze_symbol — الاستراتيجية الجديدة (بدون RVOL احتياطي)
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
     df_weekly = candles_to_df(fetch_candles(symbol, "1w", 200))
@@ -312,57 +312,18 @@ def analyze_symbol(symbol: str) -> dict:
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
+    # ✅ scan_setup يُنتج كل شيء (مع RVOL من 1H فقط داخل analysis.py)
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
-    # ✅ RVOL احتياطي متعدد الفريمات
-    rv_1h = rvol(df_1h, 20)
-    rv_4h = rvol(df_4h, 20)
-    rv_1d = rvol(df_daily, 20)
-
-    rv_final = rv_1h
-    rv_source = "1H"
-    if rv_1h < 0.5:
-        if rv_4h >= 1.0:
-            rv_final = rv_4h; rv_source = "4H"
-        elif rv_1d >= 1.0:
-            rv_final = rv_1d; rv_source = "1D"
-        else:
-            rv_final = max(rv_1h, rv_4h, rv_1d)
-            rv_source = "max"
-
-    # ✅ إعادة حساب النقاط مع RVOL الجديد
-    scan["rvol"] = round(rv_final, 2)
-    scan["rvol_source"] = rv_source
-    scan["score"] = calculate_score(
-        trend_w=scan["trend_w"]["status"],
-        trend_d=scan["trend_d"]["status"],
-        trend_4h=scan["trend_4h"]["status"],
-        sweep=scan.get("sweep"),
-        fvg=scan.get("fvg"),
-        confirmed=scan["sequence"].get("confirm_index") is not None,
-        rvol_val=rv_final,
-    )
-
-    # ✅ إعادة تصنيف البطاقة
-    setup_for_classify = {
-        "sequence_found": scan["sequence"]["found"],
-        "trend_w": scan["trend_w"]["status"],
-        "direction": scan["direction"],
-        "score": scan["score"],
-        "rr": scan["levels"].get("rr", 0),
-    }
-    card_new = classify_setup(setup_for_classify)
-
     card = {
-        "color":  card_new["color"],
-        "label":  card_new["label"],
+        "color":  scan["color"],
+        "label":  scan["label"],
         "score":  scan["score"],
-        "status": card_new["status"],
+        "status": scan["status"],
         "trend_w":  scan["trend_w"]["status"],
         "trend_d":  scan["trend_d"]["status"],
         "trend_4h": scan["trend_4h"]["status"],
-        "rvol":     scan["rvol"],
-        "rvol_source": rv_source,
+        "rvol":     scan["rvol"],   # من 1H فقط — كما في المواصفة
         "sweep":    bool(scan.get("sweep")),
         "fvg":      bool(scan.get("fvg")),
         "rr":       scan["levels"].get("rr", 0),
@@ -371,7 +332,6 @@ def analyze_symbol(symbol: str) -> dict:
     direction = scan["direction"] or "bullish"
     levels = scan["levels"]
 
-    # ✅ الفريمات — تعرض الحالة الحقيقية (up/down/neutral)
     def tf_snap(df, label, use_ema200=False):
         ts = trend_status(df, use_ema200=use_ema200)
         r = df.iloc[-1]
