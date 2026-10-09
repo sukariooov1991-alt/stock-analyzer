@@ -1,5 +1,5 @@
 /* ============================================================
-   app.js — Final (تحديث فوري بعد F5)
+   app.js — Longbridge Options Radar (Sweep + FVG)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -159,7 +159,7 @@ function updateWhalesData(root, sym, whales) {
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
 
-      if (type) type.textContent = w.type === "CALL" ? "شراء" : "بيع";
+      if (type) type.textContent = w.type;   // CALL / PUT كما هو
       if (strike) strike.textContent = w.strike;
 
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
@@ -213,34 +213,36 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
+/* ✅ الشريط السفلي — الاتجاهات + RVOL + R:R */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
   const label = c.label || "—";
 
-  const macd = c.weekly_macd ?? "—";
-  const rsi  = c.daily_rsi   ?? "—";
-  const adx  = c.adx         ?? "—";
-  const adxOk = !!c.adx_ok;
-  const volOk = !!c.volume_ok;
+  const tw = c.trend_w  || "neutral";
+  const td = c.trend_d  || "neutral";
+  const t4 = c.trend_4h || "neutral";
 
-  const macdIcon = (typeof macd === "number")
-    ? (macd > 0 ? "🟢" : macd < 0 ? "🔴" : "⚪") : "⚪";
+  const twIcon = tw === "up" ? "🟢" : tw === "down" ? "🔴" : "⚪";
+  const tdIcon = td === "up" ? "🟢" : td === "down" ? "🔴" : "⚪";
+  const t4Icon = t4 === "up" ? "🟢" : t4 === "down" ? "🔴" : "⚪";
 
-  let rsiIcon = "⏸️";
-  if (c.status === "call") rsiIcon = "🟢";
-  else if (c.status === "put") rsiIcon = "🔴";
+  const rvol = c.rvol ?? "—";
+  const rr   = c.rr ?? "—";
+  const rrOk = typeof rr === "number" && rr >= 2.0;
 
   return `
     <div class="summary-bar">
       <span class="summary-badge badge-${color}">${label}</span>
-      <span class="summary-item">MACD <b>${macd}</b> ${macdIcon}</span>
+      <span class="summary-item">1W ${twIcon}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">RSI <b>${rsi}</b> ${rsiIcon}</span>
+      <span class="summary-item">1D ${tdIcon}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">ADX <b>${adx}</b> ${adxOk ? "✅" : "❌"}</span>
+      <span class="summary-item">4H ${t4Icon}</span>
       <span class="summary-sep">·</span>
-      <span class="summary-item">الحجم ${volOk ? "✅" : "❌"}</span>
+      <span class="summary-item">RVOL <b>${rvol}</b></span>
+      <span class="summary-sep">·</span>
+      <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
     </div>
   `;
 }
@@ -288,8 +290,8 @@ function buildCard(cardData) {
 
   const row3 = `<div class="card-row row-3">
     <div class="cell"><div class="label">الوقف</div><div class="val">${lv.stop ? "$" + lv.stop : "—"}</div></div>
-    <div class="cell"><div class="label">الهدف 2</div><div class="val">${lv.target2 ? "$" + lv.target2 : "—"}</div></div>
-    <div class="cell"><div class="label">الهدف 1</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
+    <div class="cell"><div class="label">R:R</div><div class="val">${lv.rr || "—"}</div></div>
+    <div class="cell"><div class="label">الهدف</div><div class="val">${lv.target1 ? "$" + lv.target1 : "—"}</div></div>
     <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
@@ -304,28 +306,28 @@ function buildCard(cardData) {
     </div>`).join("");
 
   const oiHtml = `<div class="oi-grid">
-    ${buildOIBlockStatic("مفتوحة - بيع", "put-oi", "#8b5cf6")}
-    ${buildOIBlockStatic("سيولة - بيع", "put-liq", "#ef4444")}
-    ${buildOIBlockStatic("مفتوحة - شراء", "call-oi", "#3b82f6")}
-    ${buildOIBlockStatic("سيولة - شراء", "call-liq", "#22c55e")}
+    ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
+    ${buildOIBlockStatic("سيولة - PUT", "put-liq", "#ef4444")}
+    ${buildOIBlockStatic("مفتوحة - CALL", "call-oi", "#3b82f6")}
+    ${buildOIBlockStatic("سيولة - CALL", "call-liq", "#22c55e")}
   </div>`;
 
   const boxesHtml = `
     <div class="putcall-boxes">
       <div class="pcbox pcbox-call">
-        <div class="pcbox-label">مفتوحة - شراء</div>
+        <div class="pcbox-label">مفتوحة - CALL</div>
         <div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-put">
-        <div class="pcbox-label">مفتوحة - بيع</div>
+        <div class="pcbox-label">مفتوحة - PUT</div>
         <div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-call">
-        <div class="pcbox-label">حجم - شراء</div>
+        <div class="pcbox-label">حجم - CALL</div>
         <div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div>
       </div>
       <div class="pcbox pcbox-put">
-        <div class="pcbox-label">حجم - بيع</div>
+        <div class="pcbox-label">حجم - PUT</div>
         <div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div>
       </div>
     </div>`;
@@ -362,6 +364,7 @@ function buildCard(cardData) {
 
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
+  const lv = data.levels || {};
   const sym = data.symbol;
   const price = data.price ?? 0;
 
@@ -379,6 +382,25 @@ function updateCardInPlace(cardEl, data) {
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
   const btmPrice = cardEl.querySelector("[data-btm-price]");
   if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
+
+  // ✅ Row 2 + Row 3 — المستويات
+  const row2 = cardEl.querySelector(".row-2");
+  if (row2) {
+    const cells = row2.querySelectorAll(".cell .val");
+    if (cells[0]) cells[0].textContent = lv.dte || "—";
+    if (cells[1]) cells[1].textContent = (lv.premium && lv.premium !== "—") ? "$" + lv.premium : "—";
+    if (cells[2]) cells[2].textContent = lv.expiry || "—";
+    if (cells[3]) cells[3].textContent = lv.strike || "—";
+  }
+
+  const row3 = cardEl.querySelector(".row-3");
+  if (row3) {
+    const cells = row3.querySelectorAll(".cell .val");
+    if (cells[0]) cells[0].textContent = lv.stop ? "$" + lv.stop : "—";
+    if (cells[1]) cells[1].textContent = lv.rr || "—";
+    if (cells[2]) cells[2].textContent = lv.target1 ? "$" + lv.target1 : "—";
+    if (cells[3]) cells[3].textContent = lv.entry ? "$" + lv.entry : "—";
+  }
 
   const tfs = data.timeframes || [];
   tfs.forEach((t, idx) => {
@@ -419,7 +441,6 @@ function rebuildCard(symbol, newData) {
   const oldCard = cards[idx];
   const merged = { ...newData };
 
-  // ✅ لا نمسح البيانات إذا الجديدة فارغة
   if (!newData.call_oi || newData.call_oi.length === 0) {
     merged.call_oi = oldCard.call_oi || [];
   }
@@ -447,8 +468,6 @@ function rebuildCard(symbol, newData) {
   const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!cardEl) return;
   updateCardInPlace(cardEl, merged);
-
-  // ✅ احفظ في localStorage بعد كل تحديث
   saveCards();
 }
 
@@ -576,9 +595,6 @@ searchForm.addEventListener("submit", (e) => {
   symbolInput.blur();
 });
 
-/* ============================================================
-   ✅ التهيئة — تحديث فوري بعد F5
-   ============================================================ */
 (function init() {
   cards = loadCards();
   renderCards();
@@ -588,7 +604,6 @@ searchForm.addEventListener("submit", (e) => {
     startStatePolling(c.symbol);
   });
 
-  // ✅ التحديث الفوري لكل بطاقة (بعد ثانيتين من تحميل الصفحة)
   setTimeout(() => {
     cards.forEach(c => fetchState(c.symbol));
   }, 2000);
