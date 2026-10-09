@@ -1,6 +1,7 @@
 """
-main.py — FastAPI + Longbridge + Telegram
-الاستراتيجية: RSI + MACD Swing (CALL + PUT)
+main.py — Longbridge Options Radar
+FastAPI + Longbridge + Telegram Alerts
+الاستراتيجية: Sweep + Virgin FVG + تأكيد 1H
 """
 import os
 import time
@@ -21,8 +22,11 @@ from longbridge.openapi import (
 )
 
 from analysis import (
-    ema, rsi, atr, adx, vwap, rvol,
-    macd, swing_signal, compute_swing_levels,
+    ema, rsi, atr, adx, vwap, rvol, macd,
+    swing_highs, swing_lows,
+    trend_status, detect_fvgs, detect_sweep,
+    check_entry_sequence, calculate_score,
+    classify_setup, compute_levels, scan_setup,
 )
 
 PORT = int(os.environ.get("PORT", 10000))
@@ -122,7 +126,10 @@ def _put_of(c):
     return getattr(po, "symbol", None) if po else None
 
 
-def fetch_option_data(symbol, direction, price, strategy="weekly"):
+def fetch_option_data(symbol, direction, price, strategy="swing"):
+    """
+    strategy = "swing" → DTE 7-15 يوم (حسب المواصفة الجديدة)
+    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = {"strike":"—","expiry":"—","dte":"—","premium":"—","delta":None,
@@ -132,8 +139,8 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         raw_dates = ctx.option_chain_expiry_date_list(sym)
         if not raw_dates: return result
         today = datetime.now(timezone.utc).date()
-        # ✅ التعديل: target_dte = 37 دائماً
-        target_dte = 37
+        # ✅ DTE 7-15 يوم (نستهدف 10 أيام)
+        target_dte = 10
         parsed = []
         for d in raw_dates:
             if isinstance(d, date_cls):
@@ -143,9 +150,16 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
                     dd = datetime.strptime(d[:10], "%Y-%m-%d").date()
                     if dd > today: parsed.append(dd)
                 except Exception: continue
-        if not parsed: return result
-        exp_date, dte = min([(d, (d - today).days) for d in parsed],
-                            key=lambda x: abs(x[1] - target_dte))
+
+        # ✅ فلتر: نبحث عن تواريخ بين 5 و 20 يوم
+        valid = [(d, (d - today).days) for d in parsed if 5 <= (d - today).days <= 20]
+        if not valid:
+            # إذا لم يوجد، نختار الأقرب
+            valid = [(d, (d - today).days) for d in parsed]
+        if not valid:
+            return result
+
+        exp_date, dte = min(valid, key=lambda x: abs(x[1] - target_dte))
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
@@ -163,14 +177,15 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
         def build_put_sym(sk):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
+        # اختيار العقد الرئيسي — Delta 0.40-0.55 (قريب من السعر)
         if direction == "bullish":
-            target = price * 1.015
+            target = price * 1.005
             cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
             if not cands: return result
             best = min(cands, key=lambda c: abs(_strike_of(c) - target))
             option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
         else:
-            target = price * 0.985
+            target = price * 0.995
             cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
             if not cands: return result
             best = min(cands, key=lambda c: abs(_strike_of(c) - target))
@@ -278,14 +293,15 @@ def fetch_option_data(symbol, direction, price, strategy="weekly"):
 
 
 # ============================================================
-# analyze_symbol
+# ✅ analyze_symbol — الاستراتيجية الجديدة
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 100))
-    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 200))
-    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200))
-    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200))
+    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 200))
+    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 300))
+    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 300))
+    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 300))
 
+    # enrich بالـ EMA/ATR وغيرها
     def enrich(df):
         df["ema20"] = ema(df["close"], 20)
         df["ema50"] = ema(df["close"], 50)
@@ -300,28 +316,36 @@ def analyze_symbol(symbol: str) -> dict:
     df_4h     = enrich(df_4h)
     df_1h     = enrich(df_1h)
 
+    # السعر الحالي
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    sig = swing_signal(df_weekly, df_daily)
+    # ✅ تشغيل الماسح الجديد
+    scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
+    # بناء البطاقة
     card = {
-        "color":       sig["color"],
-        "label":       sig["label"],
-        "score":       sig["score"],
-        "status":      sig["status"],
-        "weekly_macd": sig["weekly_macd"],
-        "daily_rsi":   sig["daily_rsi"],
-        "rsi_prev":    sig["rsi_prev"],
-        "adx":         sig["adx"],
-        "adx_ok":      sig["adx_ok"],
-        "volume_ok":   sig["volume_ok"],
+        "color":  scan["color"],
+        "label":  scan["label"],
+        "score":  scan["score"],
+        "status": scan["status"],
+        "trend_w":  scan["trend_w"]["status"],
+        "trend_d":  scan["trend_d"]["status"],
+        "trend_4h": scan["trend_4h"]["status"],
+        "rvol":     scan["rvol"],
+        "sweep":    bool(scan.get("sweep")),
+        "fvg":      bool(scan.get("fvg")),
+        "rr":       scan["levels"].get("rr", 0),
     }
 
-    direction = sig["direction"] or "bullish"
-    levels = compute_swing_levels(price, sig["atr"], direction)
+    # الاتجاه المختار (CALL أو PUT أو لا شيء)
+    direction = scan["direction"] or "bullish"
 
+    # المستويات
+    levels = scan["levels"]
+
+    # الفريمات للعرض
     def tf_snap(df, label):
         r = df.iloc[-1]
         up = float(r["ema20"]) > float(r["ema50"])
@@ -341,13 +365,14 @@ def analyze_symbol(symbol: str) -> dict:
         tf_snap(df_1h,     "1H"),
     ]
 
-    opt = fetch_option_data(symbol, direction, price, "weekly")
+    # بيانات العقد
+    opt = fetch_option_data(symbol, direction, price, "swing")
     levels["strike"]  = opt.get("strike", "—")
     levels["expiry"]  = opt.get("expiry", "—")
     levels["dte"]     = opt.get("dte", "—")
     levels["premium"] = opt.get("premium", "—")
 
-    last = df_daily.iloc[-1]
+    # الدعم والمقاومة للعرض
     supports = [
         round(float(df_daily["low"].iloc[-20:].min()), 2),
         round(float(df_weekly["low"].iloc[-4:].min()), 2),
@@ -366,7 +391,7 @@ def analyze_symbol(symbol: str) -> dict:
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
-        "vwap": round(float(last["vwap"]), 2),
+        "vwap": round(float(df_1h["vwap"].iloc[-1]), 2),
         "supports": supports,
         "resistances": resistances,
         "call_oi": opt.get("call_oi", []),
@@ -404,11 +429,12 @@ def build_alert_message(data):
 💪 قوة الإشارة: <b>{card.get('score', 0)}%</b>
 💰 السعر: <b>${price}</b>
 
-📊 <b>التحليل:</b>
-  • MACD أسبوعي: <b>{card.get('weekly_macd','—')}</b>
-  • RSI يومي: <b>{card.get('daily_rsi','—')}</b>
-  • ADX: <b>{card.get('adx','—')}</b> ({'✅' if card.get('adx_ok') else '❌'})
-  • Volume: {'✅' if card.get('volume_ok') else '❌'}
+📊 <b>الاتجاه:</b>
+  • 1W: <b>{card.get('trend_w','—')}</b>
+  • 1D: <b>{card.get('trend_d','—')}</b>
+  • 4H: <b>{card.get('trend_4h','—')}</b>
+  • RVOL: <b>{card.get('rvol','—')}x</b>
+  • R:R: <b>{card.get('rr','—')}</b>
 
 📋 <b>العقد:</b>
   • STRIKE: <b>{lv.get('strike','—')}</b>
@@ -418,8 +444,7 @@ def build_alert_message(data):
 📊 <b>المستويات:</b>
   • ENTRY: ${lv.get('entry','—')}
   • STOP: ${lv.get('stop','—')}
-  • TARGET 1: ${lv.get('target1','—')}
-  • TARGET 2: ${lv.get('target2','—')}
+  • TARGET: ${lv.get('target1','—')}
 
 ⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
 """
@@ -443,7 +468,6 @@ async def watchlist_checker():
                     card = data.get("card", {})
                     color = card.get("color", "gray")
 
-                    prev_color = _last_color.get(sym.upper())
                     _last_color[sym.upper()] = color
 
                     if color not in ("green", "red"):
@@ -483,7 +507,7 @@ async def lifespan(app: FastAPI):
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            send_telegram_alert("🚀 <b>محلل الأسهم</b> — النظام يعمل")
+            send_telegram_alert("🚀 <b>Longbridge Options Radar</b> — النظام يعمل")
         except Exception: pass
 
     async def keepalive():
@@ -502,7 +526,7 @@ async def lifespan(app: FastAPI):
     _quote_ctx = None
 
 
-app = FastAPI(title="Stock Analyzer", lifespan=lifespan)
+app = FastAPI(title="Longbridge Options Radar", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
 
