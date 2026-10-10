@@ -1,6 +1,6 @@
 /* ============================================================
    app.js — Longbridge Options Radar (Cascade Break & Retest)
-   الأصلي محفوظ + Gemini queue + دعم الأصفر والرمادي
+   البحث اليدوي + Gemini لكل البطاقات (رمادي/أصفر/أخضر/أحمر)
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -96,7 +96,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* Gemini */
+/* ===== Gemini Queue ===== */
 function enqueueAIRequest(symbol) {
   if (!symbol || aiRequested.has(symbol)) return;
   aiRequested.add(symbol);
@@ -130,7 +130,7 @@ async function runAIQueue() {
   aiQueueRunning = false;
 }
 
-/* OI */
+/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -156,7 +156,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* Whales */
+/* ===== Whales ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -231,7 +231,12 @@ function updateAllDynamic(root, sym, card) {
   updateWhalesData(root, sym, card.whales || []);
 }
 
-/* Summary bar — Cascade */
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/* ===== Summary Bar ===== */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
@@ -266,15 +271,11 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
+/* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
-  const cls = c.color || "gray";   // ← يظهر الرمادي والأصفر
+  const cls = c.color || "gray";
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
 
@@ -364,8 +365,8 @@ function buildCard(cardData) {
     e.stopPropagation(); deleteCard(sym);
   });
 
-  // Gemini only for green/red
-  if (!cardData.ai_analysis && (cls === "green" || cls === "red")) {
+  // ✅ Gemini لكل البطاقات — بما فيها الرمادي والأصفر
+  if (!cardData.ai_analysis) {
     enqueueAIRequest(sym);
   }
 
@@ -447,7 +448,6 @@ function rebuildCard(symbol, newData) {
 function renderCards() {
   cardsArea.innerHTML = "";
   emptyState.style.display = cards.length ? "none" : "block";
-  // ترتيب: أخضر/أحمر → أصفر → رمادي
   const order = { green: 0, red: 0, yellow: 1, gray: 2 };
   const sorted = [...cards].sort((a, b) => {
     const oa = order[a.card?.color] ?? 3;
@@ -573,8 +573,8 @@ searchForm.addEventListener("submit", (e) => {
   cards.forEach(c => {
     connectLive(c.symbol);
     startStatePolling(c.symbol);
-    const color = c.card?.color;
-    if (!c.ai_analysis && (color === "green" || color === "red")) enqueueAIRequest(c.symbol);
+    // ✅ Gemini لكل البطاقات المحفوظة
+    if (!c.ai_analysis) enqueueAIRequest(c.symbol);
   });
   setTimeout(() => {
     cards.forEach(c => fetchState(c.symbol));
