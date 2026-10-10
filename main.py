@@ -46,15 +46,12 @@ _ai_cache: dict[str, tuple[float, str]] = {}
 _AI_CACHE_TTL = 1800
 _ANALYZE_TTL = 25
 
-MAX_PREMIUM = 2.5
-MAX_SPREAD  = 0.10
+# ✅ فلتر السعر حُذف — لا MAX_PREMIUM
+# السبريد يبقى لكن مخفف (اختياري)
 DTE_MIN = 5
 DTE_MAX = 20
 DTE_TARGET = 10
 OTM_TARGET = 0.02
-OTM_MIN = 0.005
-OTM_MAX = 0.04
-MAX_CANDIDATES = 10
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
@@ -263,24 +260,13 @@ def _quote_one(ctx, sym_opt):
     except Exception: return None
 
 
-def _try_strike(ctx, opt_sym):
-    if not opt_sym: return False, None, None, None, "no_symbol"
-    q = _quote_one(ctx, opt_sym)
-    if not q: return False, None, None, None, "no_quote"
-    last, ask, bid = q["last"], q["ask"], q["bid"]
-    spread = (ask - bid) if ask > bid > 0 else 999
-    entry = ask if ask > 0 else last
-    delta = None
-    if hasattr(q["raw"], "delta"):
-        try: delta = round(float(q["raw"].delta), 3)
-        except Exception: pass
-    if entry is None: return False, None, spread, delta, "no_premium"
-    if entry > MAX_PREMIUM: return False, round(entry, 2), spread, delta, "premium_too_high"
-    if spread > MAX_SPREAD: return False, round(entry, 2), spread, delta, "spread_too_wide"
-    return True, round(entry, 2), spread, delta, "ok"
-
-
 def fetch_option_data(symbol, direction, price, strategy="swing"):
+    """
+    يختار أقرب Strike:
+      - للـ bullish: من أقرب 5 CALL فوق السعر (الأقرب إلى 2% OTM)
+      - للـ bearish: من أقرب 5 PUT تحت السعر
+      - بدون فلتر سعر/سبريد صارم — نأخذ الأقرب فقط
+    """
     ctx = get_ctx()
     sym = norm(symbol)
     result = _empty_option_result()
@@ -307,43 +293,59 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         chain = ctx.option_chain_info_by_date(sym, exp_date)
         if not chain:
             result["filter_reason"] = "no_chain"; return result
+
         base_match = re.match(r'^([A-Z.]+)', sym.replace(".US", ""))
         base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
         yy, mm, dd = exp_date.strftime("%y"), exp_date.strftime("%m"), exp_date.strftime("%d")
         prefix = f"{base_sym}{yy}{mm}{dd}"
         def build_call_sym(sk): return f"{prefix}C{str(int(round(sk*1000))).zfill(8)}.US"
         def build_put_sym(sk):  return f"{prefix}P{str(int(round(sk*1000))).zfill(8)}.US"
+
         is_call = (direction == "bullish")
+
+        # ✅ أقرب 5 CALL فوق السعر + أقرب 5 PUT تحت السعر
+        calls_above = sorted(
+            [c for c in chain if _call_of(c) and _strike_of(c) > price],
+            key=lambda c: _strike_of(c)
+        )[:NEARBY_STRIKES]
+        puts_below = sorted(
+            [c for c in chain if _put_of(c) and _strike_of(c) < price],
+            key=lambda c: -_strike_of(c)
+        )[:NEARBY_STRIKES]
+
         target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
-        cands = []
-        for c in chain:
-            strike = _strike_of(c)
-            opt_sym = _call_of(c) if is_call else _put_of(c)
-            if not opt_sym or strike is None or price <= 0: continue
-            otm = ((strike - price)/price) if is_call else ((price - strike)/price)
-            if OTM_MIN <= otm <= OTM_MAX: cands.append(c)
-        if not cands:
-            result["filter_reason"] = "no_call_strike_in_otm_range" if is_call else "no_put_strike_in_otm_range"
+
+        if is_call:
+            cands = calls_above
         else:
-            cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
-            chosen = None
-            for c in cands[:MAX_CANDIDATES]:
-                sk = _strike_of(c)
-                opt_sym = _call_of(c) if is_call else _put_of(c)
-                if not opt_sym: continue
-                ok, prem, spread, delta, reason = _try_strike(ctx, opt_sym)
-                if ok:
-                    chosen = {"strike": sk, "sym": opt_sym, "premium": prem, "delta": delta}
-                    result["filter_pass"] = True
-                    break
+            cands = puts_below
+
+        if not cands:
+            result["filter_reason"] = "no_call_strike" if is_call else "no_put_strike"
+        else:
+            # ✅ الأقرب إلى 2% OTM — بدون فلتر السعر
+            best = min(cands, key=lambda c: abs(_strike_of(c) - target_price))
+            strike = _strike_of(best)
+            opt_sym = _call_of(best) if is_call else _put_of(best)
+            opt_type = "C" if is_call else "P"
+
+            result["strike"] = f"{opt_type} {int(strike)}"
+
+            if opt_sym:
+                q = _quote_one(ctx, opt_sym)
+                if q:
+                    last = q["last"]; ask = q["ask"]
+                    premium = ask if (ask and ask > 0) else last
+                    if premium is not None:
+                        result["premium"] = round(premium, 2)
+                        result["filter_pass"] = True
+                    if hasattr(q["raw"], "delta"):
+                        try: result["delta"] = round(float(q["raw"].delta), 3)
+                        except Exception: pass
                 else:
-                    result["filter_reason"] = f"{reason} @ {int(sk)}"
-            if chosen:
-                result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
-                result["premium"] = chosen["premium"]
-                if chosen["delta"] is not None: result["delta"] = chosen["delta"]
-            else:
-                result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
+                    result["filter_reason"] = "no_quote"
+
+        # OI / Whales
         strikes_map = {}
         for c in chain:
             sk = _strike_of(c)
@@ -351,9 +353,11 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
             cs = _call_of(c) or build_call_sym(sk)
             ps = _put_of(c) or build_put_sym(sk)
             strikes_map[sk] = (cs, ps)
-        calls_above = sorted([s for s in strikes_map if s > price])[:NEARBY_STRIKES]
-        puts_below = sorted([s for s in strikes_map if s < price], reverse=True)[:NEARBY_STRIKES]
-        display = sorted(set(calls_above + puts_below))
+
+        calls_disp = sorted([s for s in strikes_map if s > price])[:NEARBY_STRIKES]
+        puts_disp = sorted([s for s in strikes_map if s < price], reverse=True)[:NEARBY_STRIKES]
+        display = sorted(set(calls_disp + puts_disp))
+
         all_syms = set()
         for sk in display:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -367,6 +371,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 if qs:
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
+
         tc_oi = tp_oi = tc_v = tp_v = 0
         cd = []
         for sk in sorted(display, reverse=True):
@@ -393,6 +398,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         result["total_call_oi"] = tc_oi; result["total_put_oi"] = tp_oi
         result["total_call_vol"] = tc_v; result["total_put_vol"] = tp_v
         result["call_oi"] = cd; result["put_oi"] = pd_
+
         whales = []
         for sk in display:
             cs, ps = strikes_map.get(sk, (None, None))
@@ -448,8 +454,8 @@ def analyze_symbol(symbol):
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ جلب العقود دائماً — حتى للرمادي والأصفر
-    direction = scan["direction"] or "bullish"
+    # ✅ إصلاح: "call"/"put" ← "bullish"/"bearish"
+    direction = "bearish" if scan.get("direction") == "put" else "bullish"
     opt = fetch_option_data(symbol, direction, price, "swing")
 
     levels["strike"]  = opt.get("strike", "—")
@@ -636,7 +642,6 @@ async def ai_analysis(symbol):
         data = await asyncio.to_thread(analyze_cached, sym)
     except Exception as e:
         return {"ok": False, "reason": f"analyze_error: {e}"}
-    # ✅ نسمح للأصفر والرمادي أيضاً (لا شرط على اللون)
     try:
         text = await asyncio.to_thread(get_ai_analysis, data)
     except Exception as e:
