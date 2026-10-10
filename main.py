@@ -46,8 +46,7 @@ _ai_cache: dict[str, tuple[float, str]] = {}
 _AI_CACHE_TTL = 1800
 _ANALYZE_TTL = 25
 
-# ✅ فلتر السعر حُذف — لا MAX_PREMIUM
-# السبريد يبقى لكن مخفف (اختياري)
+# ✅ فلاتر التاريخ فقط (لا فلتر سعر أو سبريد)
 DTE_MIN = 5
 DTE_MAX = 20
 DTE_TARGET = 10
@@ -263,9 +262,10 @@ def _quote_one(ctx, sym_opt):
 def fetch_option_data(symbol, direction, price, strategy="swing"):
     """
     يختار أقرب Strike:
-      - للـ bullish: من أقرب 5 CALL فوق السعر (الأقرب إلى 2% OTM)
-      - للـ bearish: من أقرب 5 PUT تحت السعر
-      - بدون فلتر سعر/سبريد صارم — نأخذ الأقرب فقط
+      - bullish: من أقرب 5 CALL فوق السعر
+      - bearish: من أقرب 5 PUT تحت السعر
+      - الأقرب إلى 2% OTM هو المختار
+      - بدون فلتر سعر/سبريد
     """
     ctx = get_ctx()
     sym = norm(symbol)
@@ -303,7 +303,6 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
 
         is_call = (direction == "bullish")
 
-        # ✅ أقرب 5 CALL فوق السعر + أقرب 5 PUT تحت السعر
         calls_above = sorted(
             [c for c in chain if _call_of(c) and _strike_of(c) > price],
             key=lambda c: _strike_of(c)
@@ -314,23 +313,16 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         )[:NEARBY_STRIKES]
 
         target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
-
-        if is_call:
-            cands = calls_above
-        else:
-            cands = puts_below
+        cands = calls_above if is_call else puts_below
 
         if not cands:
             result["filter_reason"] = "no_call_strike" if is_call else "no_put_strike"
         else:
-            # ✅ الأقرب إلى 2% OTM — بدون فلتر السعر
             best = min(cands, key=lambda c: abs(_strike_of(c) - target_price))
             strike = _strike_of(best)
             opt_sym = _call_of(best) if is_call else _put_of(best)
             opt_type = "C" if is_call else "P"
-
             result["strike"] = f"{opt_type} {int(strike)}"
-
             if opt_sym:
                 q = _quote_one(ctx, opt_sym)
                 if q:
@@ -454,7 +446,6 @@ def analyze_symbol(symbol):
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ إصلاح: "call"/"put" ← "bullish"/"bearish"
     direction = "bearish" if scan.get("direction") == "put" else "bullish"
     opt = fetch_option_data(symbol, direction, price, "swing")
 
