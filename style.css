@@ -264,3 +264,28 @@ body {
   .tf-grid { grid-template-columns: repeat(2, 1fr); }
   .bottom-grid { grid-template-columns: repeat(2, 1fr); }
 }
+.tf-cell.yellow {
+  border-color: var(--yellow-border);
+  background: rgba(234,179,8,0.06);
+}
+.tf-cell.yellow .tf-label { color: var(--yellow-border); }
+
+.tf-state-txt {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text);
+  text-align: center;
+  padding: 6px 4px;
+  line-height: 1.5;
+  direction: rtl;
+}
+.tf-cell.up .tf-state-txt { color: var(--green-border); }
+.tf-cell.down .tf-state-txt { color: var(--red-border); }
+.tf-cell.yellow .tf-state-txt { color: var(--yellow-border); }
+.tf-cell.neutral .tf-state-txt { color: var(--text-muted); }
+
+.tf-sub {
+  font-size: 9.5px;
+  color: var(--text-muted);
+  opacity: 0.8;
+}
