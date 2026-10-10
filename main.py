@@ -1,7 +1,7 @@
 """
-main.py — Longbridge Options Radar
-FastAPI + Longbridge + Telegram Alerts
-الاستراتيجية: Sweep + Virgin FVG + تأكيد 1H
+main.py — Longbridge Options Radar (Cascade Break & Retest)
+FastAPI + Longbridge + Telegram + Gemini (async)
+بحث يدوي — لا مسح تلقائي.
 """
 import os
 import time
@@ -11,6 +11,7 @@ import requests
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, date as date_cls
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,12 +22,11 @@ from longbridge.openapi import (
     TradeSessions, SubType, PushQuote,
 )
 
+from market_time import candles_to_df
+
 from analysis import (
-    ema, rsi, atr, adx, vwap, rvol, macd,
-    swing_highs, swing_lows,
-    trend_status, detect_fvgs, detect_sweep,
-    check_entry_sequence, calculate_score,
-    classify_setup, compute_levels, scan_setup,
+    atr, find_retest,
+    scan_setup,
 )
 
 PORT = int(os.environ.get("PORT", 10000))
@@ -35,17 +35,43 @@ _lb_config = Config.from_apikey_env()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# ✅ Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODELS  = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+]
+GEMINI_TIMEOUT = 12
+
 _quote_ctx: QuoteContext | None = None
 _event_loop: asyncio.AbstractEventLoop | None = None
 _subscribed: set[str] = set()
 _sent_alerts: set[str] = set()
 _watchlist: set[str] = set()
 _analyze_cache: dict[str, tuple[float, dict]] = {}
-_last_color: dict[str, str] = {}
+_ai_cache: dict[str, tuple[float, str]] = {}
+_AI_CACHE_TTL = 1800
 _ANALYZE_TTL = 25
+
+# ✅ فلاتر العقد
+MAX_PREMIUM = 2.5
+MAX_SPREAD  = 0.10
+DTE_MIN     = 5
+DTE_MAX     = 20
+DTE_TARGET  = 10
+OTM_TARGET  = 0.02
+OTM_MIN     = 0.005
+OTM_MAX     = 0.04
+MAX_CANDIDATES = 10
 
 WHALE_MIN_VOLUME = 3000
 WHALE_MIN_OI     = 5000
+NEARBY_STRIKES = 5
+OPTION_QUOTE_BATCH = 50
+
+VALID_COLORS = ("green", "red")
 
 
 def get_ctx():
@@ -56,7 +82,7 @@ def get_ctx():
 
 
 def norm(symbol: str) -> str:
-    s = symbol.strip().upper()
+    s = symbol.strip().upper().replace("-", ".")
     return s if "." in s else f"{s}.US"
 
 
@@ -69,35 +95,169 @@ def send_telegram_alert(message: str) -> bool:
             "chat_id": TELEGRAM_CHAT_ID, "text": message,
             "parse_mode": "HTML", "disable_web_page_preview": True,
         }, timeout=10)
-        print(f"[TELEGRAM] {r.status_code}", flush=True)
         return r.status_code == 200
     except Exception as e:
         print(f"[TELEGRAM] {e}", flush=True)
         return False
 
 
-def candles_to_df(candles):
-    import pandas as pd
-    return pd.DataFrame([{
-        "time": c.timestamp, "open": float(c.open), "high": float(c.high),
-        "low": float(c.low), "close": float(c.close), "volume": int(c.volume),
-    } for c in candles])
+# ============================================================
+# Gemini
+# ============================================================
+def _build_ai_prompt(data: dict) -> str:
+    sym = data.get("symbol", "")
+    card = data.get("card", {}) or {}
+    lv = data.get("levels", {}) or {}
+    bi = data.get("break_info", {}) or {}
+    tfs = data.get("timeframes", []) or []
 
+    tf_lines = []
+    for t in tfs:
+        if t.get("broke_resistance"):
+            st = "مخترق صعوداً"
+        elif t.get("broke_support"):
+            st = "مكسور هبوطاً"
+        else:
+            st = "محايد"
+        tf_lines.append(
+            f"- {t.get('label')}: مقاومة {t.get('resistance')} / "
+            f"دعم {t.get('support')} / {st}"
+        )
+
+    direction_txt = "CALL (صاعد)" if card.get("color") == "green" else "PUT (هابط)"
+    stage_txt = {
+        "daily_break_weekly": "إغلاق يومي خارج قمة/قاع الأسبوع السابق",
+        "4h_break_daily": "إغلاق 4H خارج قمة/قاع اليوم السابق",
+    }.get(card.get("stage"), "—")
+
+    return f"""أنت محلل فني محترف لأسواق الأسهم والخيارات الأمريكية.
+حلّل هذه الإشارة الفنية بإيجاز شديد في 3-4 أسطر عربية فقط.
+ركّز على: قوة الزخم، جودة الاختراق، الثبات، السياق العام، وأهم مخاطبة أو مخاطرة.
+لا تكرر الأرقام حرفياً، ولا تستخدم Markdown، ولا رموز تعبيرية، ولا عناوين.
+اكتب نصاً متصلاً كأنك تخاطب متداولاً محترفاً.
+
+البيانات:
+- الرمز: {sym}
+- الاتجاه: {direction_txt}
+- المرحلة: {stage_txt}
+- مستوى الاختراق: {lv.get('level_broken')}
+- سعر الدخول: {lv.get('entry')}
+- الوقف: {lv.get('stop')}
+- الهدف: {lv.get('target1')}
+- R:R: {lv.get('rr')}
+- RVOL عند الاختراق: {bi.get('rvol')}
+- نمط شمعة التأكيد: {lv.get('pattern')}
+- السعر الحالي: {data.get('price')}
+
+الفريمات:
+{chr(10).join(tf_lines)}
+
+اكتب 3-4 أسطر فقط.
+"""
+
+
+def _call_gemini_once(prompt: str, model: str) -> str | None:
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+               f"models/{model}:generateContent?key={GEMINI_API_KEY}")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 260,
+                "topP": 0.95,
+            },
+        }
+        r = requests.post(url, json=payload, timeout=GEMINI_TIMEOUT)
+        if r.status_code != 200:
+            print(f"[GEMINI] {model} HTTP {r.status_code}: {r.text[:200]}", flush=True)
+            return None
+        d = r.json()
+        if d.get("promptFeedback", {}).get("blockReason"):
+            return None
+        cands = d.get("candidates") or []
+        if not cands:
+            return None
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        text = "".join(p.get("text", "") for p in parts).strip()
+        return text or None
+    except Exception as e:
+        print(f"[GEMINI] {model} exception: {e}", flush=True)
+        return None
+
+
+def get_ai_analysis(data: dict) -> str | None:
+    sym = (data.get("symbol") or "").upper().strip()
+    if not GEMINI_API_KEY or not sym:
+        return None
+    now = time.time()
+    cached = _ai_cache.get(sym)
+    if cached and now - cached[0] < _AI_CACHE_TTL:
+        return cached[1]
+    prompt = _build_ai_prompt(data)
+    for model in GEMINI_MODELS:
+        text = _call_gemini_once(prompt, model)
+        if text:
+            _ai_cache[sym] = (now, text)
+            return text
+    return None
+
+
+# تحويل الشموع موجود في market_time.py.
 
 PERIOD_MAP = {
-    "15m": Period.Min_15, "1h": Period.Min_60,
-    "4h": Period.Min_240, "1d": Period.Day, "1w": Period.Week,
+    "1h": Period.Min_60,
+    "4h": Period.Min_240,
+    "1d": Period.Day,
+    "1w": Period.Week,
 }
+
+_candle_cache: dict[str, tuple[float, list]] = {}
+_CANDLE_TTL = {"1h": 300, "4h": 900, "1d": 3600, "1w": 3600}
+_CANDLE_CACHE_MAX = 5000
 
 
 def fetch_candles(symbol, timeframe, count=200):
+    tf = timeframe.lower()
+    key = f"{symbol.upper()}:{tf}:{count}"
+    now = time.time()
+    ttl = _CANDLE_TTL.get(tf, 60)
+
+    if key in _candle_cache:
+        ts, cached = _candle_cache[key]
+        if now - ts < ttl and len(cached) >= count:
+            return cached
+
     ctx = get_ctx()
-    p = PERIOD_MAP.get(timeframe.lower())
+    p = PERIOD_MAP.get(tf)
     if p is None:
         raise ValueError(f"فريم غير مدعوم: {timeframe}")
-    return ctx.candlesticks(norm(symbol), p, count,
-                            AdjustType.NoAdjust,
-                            trade_sessions=TradeSessions.All)
+
+    candles = ctx.candlesticks(norm(symbol), p, count,
+                                AdjustType.NoAdjust,
+                                trade_sessions=TradeSessions.Intraday)
+
+    if len(_candle_cache) > _CANDLE_CACHE_MAX:
+        oldest = sorted(_candle_cache.items(), key=lambda x: x[1][0])[:1000]
+        for k, _ in oldest:
+            _candle_cache.pop(k, None)
+
+    _candle_cache[key] = (now, candles)
+    return candles
+
+
+def get_current_price(symbol: str):
+    try:
+        ctx = get_ctx()
+        sym = norm(symbol)
+        q = ctx.quote([sym])
+        if q:
+            return float(q[0].last_done)
+    except Exception:
+        pass
+    return None
 
 
 # ============================================================
@@ -126,17 +286,71 @@ def _put_of(c):
     return getattr(po, "symbol", None) if po else None
 
 
+def _empty_option_result():
+    return {
+        "strike": "—", "expiry": "—", "dte": "—", "premium": "—", "delta": None,
+        "call_oi": [], "put_oi": [],
+        "total_call_oi": 0, "total_put_oi": 0,
+        "total_call_vol": 0, "total_put_vol": 0,
+        "whales": [],
+        "filter_pass": False, "filter_reason": "",
+    }
+
+
+def _quote_one(ctx, sym_opt):
+    try:
+        oqs = ctx.option_quote([sym_opt])
+        if not oqs:
+            return None
+        oq = oqs[0]
+        last = None
+        for attr in ("last_done", "last", "price"):
+            v = getattr(oq, attr, None)
+            if v is not None:
+                try:
+                    last = float(v); break
+                except (TypeError, ValueError):
+                    continue
+        bid = float(getattr(oq, "bid", 0) or 0)
+        ask = float(getattr(oq, "ask", 0) or 0)
+        return {"last": last, "bid": bid, "ask": ask, "raw": oq}
+    except Exception:
+        return None
+
+
+def _try_strike(ctx, opt_sym):
+    if not opt_sym:
+        return False, None, None, None, "no_symbol"
+    q = _quote_one(ctx, opt_sym)
+    if not q:
+        return False, None, None, None, "no_quote"
+    last = q["last"]; ask = q["ask"]; bid = q["bid"]
+    spread = (ask - bid) if ask > bid > 0 else 999
+    entry = ask if ask > 0 else last
+    delta = None
+    if hasattr(q["raw"], "delta"):
+        try: delta = round(float(q["raw"].delta), 3)
+        except Exception: pass
+    if entry is None:
+        return False, None, spread, delta, "no_premium"
+    if entry > MAX_PREMIUM:
+        return False, round(entry, 2), spread, delta, "premium_too_high"
+    if spread > MAX_SPREAD:
+        return False, round(entry, 2), spread, delta, "spread_too_wide"
+    return True, round(entry, 2), spread, delta, "ok"
+
+
 def fetch_option_data(symbol, direction, price, strategy="swing"):
     ctx = get_ctx()
     sym = norm(symbol)
-    result = {"strike":"—","expiry":"—","dte":"—","premium":"—","delta":None,
-              "call_oi":[],"put_oi":[],"total_call_oi":0,"total_put_oi":0,
-              "total_call_vol":0,"total_put_vol":0,"whales":[]}
+    result = _empty_option_result()
     try:
         raw_dates = ctx.option_chain_expiry_date_list(sym)
-        if not raw_dates: return result
-        today = datetime.now(timezone.utc).date()
-        target_dte = 10
+        if not raw_dates:
+            result["filter_reason"] = "no_dates"
+            return result
+
+        today = datetime.now(ZoneInfo("America/New_York")).date()
         parsed = []
         for d in raw_dates:
             if isinstance(d, date_cls):
@@ -147,20 +361,22 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                     if dd > today: parsed.append(dd)
                 except Exception: continue
 
-        valid = [(d, (d - today).days) for d in parsed if 5 <= (d - today).days <= 20]
+        valid = [(d, (d - today).days) for d in parsed
+                 if DTE_MIN <= (d - today).days <= DTE_MAX]
         if not valid:
-            valid = [(d, (d - today).days) for d in parsed]
-        if not valid:
+            result["filter_reason"] = "no_valid_expiry"
             return result
 
-        exp_date, dte = min(valid, key=lambda x: abs(x[1] - target_dte))
+        exp_date, dte = min(valid, key=lambda x: abs(x[1] - DTE_TARGET))
         result["expiry"] = exp_date.strftime("%b %d").upper()
         result["dte"] = dte
 
         chain = ctx.option_chain_info_by_date(sym, exp_date)
-        if not chain: return result
+        if not chain:
+            result["filter_reason"] = "no_chain"
+            return result
 
-        base_match = re.match(r'^([A-Z]+)', sym.replace(".US", ""))
+        base_match = re.match(r'^([A-Z.]+)', sym.replace(".US", ""))
         base_sym = base_match.group(1) if base_match else sym.replace(".US", "")
         yy = exp_date.strftime("%y"); mm = exp_date.strftime("%m"); dd = exp_date.strftime("%d")
         prefix = f"{base_sym}{yy}{mm}{dd}"
@@ -171,95 +387,111 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
         def build_put_sym(sk):
             return f"{prefix}P{str(int(round(sk * 1000))).zfill(8)}.US"
 
-        if direction == "bullish":
-            target = price * 1.005
-            cands = [c for c in chain if _call_of(c) and _strike_of(c) > price]
-            if not cands: return result
-            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
-            option_symbol = _call_of(best); strike = _strike_of(best); opt_type = "C"
+        is_call = (direction == "bullish")
+        target_price = price * (1 + OTM_TARGET) if is_call else price * (1 - OTM_TARGET)
+
+        cands = []
+        for c in chain:
+            strike = _strike_of(c)
+            opt_sym = _call_of(c) if is_call else _put_of(c)
+            if not opt_sym or strike is None or price <= 0:
+                continue
+            otm_pct = ((strike - price) / price) if is_call else ((price - strike) / price)
+            if OTM_MIN <= otm_pct <= OTM_MAX:
+                cands.append(c)
+
+        if not cands:
+            result["filter_reason"] = "no_call_strike_in_otm_range" if is_call else "no_put_strike_in_otm_range"
         else:
-            target = price * 0.995
-            cands = [c for c in chain if _put_of(c) and _strike_of(c) < price]
-            if not cands: return result
-            best = min(cands, key=lambda c: abs(_strike_of(c) - target))
-            option_symbol = _put_of(best); strike = _strike_of(best); opt_type = "P"
+            cands.sort(key=lambda c: abs(_strike_of(c) - target_price))
+            chosen = None
+            for c in cands[:MAX_CANDIDATES]:
+                sk = _strike_of(c)
+                opt_sym = _call_of(c) if is_call else _put_of(c)
+                if not opt_sym:
+                    continue
+                ok, prem, spread, delta, reason = _try_strike(ctx, opt_sym)
+                if ok:
+                    chosen = {"strike": sk, "sym": opt_sym,
+                              "premium": prem, "delta": delta}
+                    result["filter_pass"] = True
+                    break
+                else:
+                    result["filter_reason"] = f"{reason} @ {int(sk)}"
 
-        result["strike"] = f"{opt_type} {int(strike)}"
-        try:
-            oqs = ctx.option_quote([option_symbol])
-            if oqs:
-                oq = oqs[0]
-                for attr in ("last_done", "last", "price"):
-                    v = getattr(oq, attr, None)
-                    if v is not None:
-                        result["premium"] = round(float(v), 2); break
-                if hasattr(oq, "delta"):
-                    result["delta"] = round(float(oq.delta), 3)
-        except Exception: pass
+            if chosen:
+                result["strike"] = f"{'C' if is_call else 'P'} {int(chosen['strike'])}"
+                result["premium"] = chosen["premium"]
+                if chosen["delta"] is not None:
+                    result["delta"] = chosen["delta"]
+            else:
+                result["filter_reason"] = result["filter_reason"] or "no_suitable_contract"
 
-        all_call_syms, all_put_syms = [], []
+        # OI / Whales دائماً
         strikes_map = {}
-
         for c in chain:
             sk = _strike_of(c)
-            if sk <= 0: continue
+            if sk <= 0:
+                continue
             cs = _call_of(c) or build_call_sym(sk)
             ps = _put_of(c)  or build_put_sym(sk)
-            all_call_syms.append(cs)
-            all_put_syms.append(ps)
             strikes_map[sk] = (cs, ps)
 
+        calls_above = sorted([s for s in strikes_map.keys() if s > price])[:NEARBY_STRIKES]
+        puts_below  = sorted([s for s in strikes_map.keys() if s < price],
+                              reverse=True)[:NEARBY_STRIKES]
+        display_strikes = sorted(set(calls_above + puts_below))
+
+        all_syms_set = set()
+        for sk in display_strikes:
+            cs, ps = strikes_map.get(sk, (None, None))
+            if cs: all_syms_set.add(cs)
+            if ps: all_syms_set.add(ps)
+
+        all_syms = list(all_syms_set)
         qmap = {}
-        all_syms = list(set(all_call_syms + all_put_syms))
-        for i in range(0, len(all_syms), 30):
+        for i in range(0, len(all_syms), OPTION_QUOTE_BATCH):
             try:
-                qs = ctx.option_quote(all_syms[i:i+30])
+                qs = ctx.option_quote(all_syms[i:i+OPTION_QUOTE_BATCH])
                 if qs:
                     for q in qs: qmap[q.symbol] = q
             except Exception: pass
 
         tc_oi = tp_oi = tc_v = tp_v = 0
-        for s in all_call_syms:
-            if s in qmap:
-                q = qmap[s]
-                tc_oi += int(getattr(q, "open_interest", 0) or 0)
-                tc_v  += int(getattr(q, "volume", 0) or 0)
-        for s in all_put_syms:
-            if s in qmap:
-                q = qmap[s]
-                tp_oi += int(getattr(q, "open_interest", 0) or 0)
-                tp_v  += int(getattr(q, "volume", 0) or 0)
+        cd = []
+        for sk in sorted(display_strikes, reverse=True):
+            cs, ps = strikes_map.get(sk, (None, None))
+            if cs and cs in qmap:
+                q = qmap[cs]
+                oi = int(getattr(q, "open_interest", 0) or 0)
+                vol = int(getattr(q, "volume", 0) or 0)
+                tc_oi += oi; tc_v += vol
+                cd.append({"strike": int(sk), "oi": oi, "volume": vol})
+            if ps and ps in qmap:
+                q = qmap[ps]
+                oi = int(getattr(q, "open_interest", 0) or 0)
+                vol = int(getattr(q, "volume", 0) or 0)
+                tp_oi += oi; tp_v += vol
+
+        pd_ = []
+        for sk in sorted(display_strikes, reverse=True):
+            cs, ps = strikes_map.get(sk, (None, None))
+            if ps and ps in qmap:
+                q = qmap[ps]
+                pd_.append({"strike": int(sk),
+                            "oi": int(getattr(q, "open_interest", 0) or 0),
+                            "volume": int(getattr(q, "volume", 0) or 0)})
 
         result["total_call_oi"]  = tc_oi
         result["total_put_oi"]   = tp_oi
         result["total_call_vol"] = tc_v
         result["total_put_vol"]  = tp_v
-
-        nearby = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:5]
-        cd, pd_ = [], []
-        for c in nearby:
-            sk = int(_strike_of(c))
-            cs, ps = strikes_map.get(_strike_of(c), (None, None))
-            if cs and cs in qmap:
-                q = qmap[cs]
-                cd.append({"strike": sk,
-                           "oi": int(getattr(q,"open_interest",0) or 0),
-                           "volume": int(getattr(q,"volume",0) or 0)})
-            if ps and ps in qmap:
-                q = qmap[ps]
-                pd_.append({"strike": sk,
-                            "oi": int(getattr(q,"open_interest",0) or 0),
-                            "volume": int(getattr(q,"volume",0) or 0)})
-        cd.sort(key=lambda x: x["strike"], reverse=True)
-        pd_.sort(key=lambda x: x["strike"], reverse=True)
         result["call_oi"] = cd
         result["put_oi"]  = pd_
 
         whales = []
-        wide = sorted(chain, key=lambda c: abs(_strike_of(c) - price))[:10]
-        for c in wide:
-            sk = int(_strike_of(c))
-            cs, ps = strikes_map.get(_strike_of(c), (None, None))
+        for sk in display_strikes:
+            cs, ps = strikes_map.get(sk, (None, None))
             for sym_opt, tp_ in ((cs, "CALL"), (ps, "PUT")):
                 if not sym_opt or sym_opt not in qmap: continue
                 q = qmap[sym_opt]
@@ -268,105 +500,62 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
                 if vol < WHALE_MIN_VOLUME and oi < WHALE_MIN_OI: continue
                 bid = float(getattr(q, "bid", 0) or 0)
                 ask = float(getattr(q, "ask", 0) or 0)
-                last = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
+                last_w = float(getattr(q, "last_done", 0) or getattr(q, "last", 0) or 0)
                 dw = "mid"
                 if ask > bid > 0:
                     sp = ask - bid
-                    pos = (last - bid) / sp if sp > 0 else 0.5
+                    pos = (last_w - bid) / sp if sp > 0 else 0.5
                     if pos >= 0.7: dw = "buy"
                     elif pos <= 0.3: dw = "sell"
-                whales.append({"strike": sk, "type": tp_, "volume": vol, "oi": oi,
-                               "bid": round(bid,2), "ask": round(ask,2),
-                               "last": round(last,2), "direction": dw})
+                whales.append({"strike": int(sk), "type": tp_, "volume": vol, "oi": oi,
+                               "bid": round(bid, 2), "ask": round(ask, 2),
+                               "last": round(last_w, 2), "direction": dw})
         whales.sort(key=lambda w: w["volume"], reverse=True)
         result["whales"] = whales[:5]
     except Exception as e:
-        print(f"[OPT] {e}", flush=True)
+        print(f"[OPT] {symbol} {e}", flush=True)
+        result["filter_reason"] = f"exception: {e}"
+
     return result
 
 
 # ============================================================
-# analyze_symbol — الاستراتيجية الجديدة (بدون RVOL احتياطي)
+# analyze_symbol
 # ============================================================
 def analyze_symbol(symbol: str) -> dict:
-    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 200))
-    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 300))
-    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 300))
-    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 300))
-
-    def enrich(df):
-        df["ema20"] = ema(df["close"], 20)
-        df["ema50"] = ema(df["close"], 50)
-        df["rsi"]   = rsi(df["close"], 14)
-        df["atr"]   = atr(df, 14)
-        df["adx"]   = adx(df, 14)
-        df["vwap"]  = vwap(df)
-        return df
-
-    df_weekly = enrich(df_weekly)
-    df_daily  = enrich(df_daily)
-    df_4h     = enrich(df_4h)
-    df_1h     = enrich(df_1h)
-
     q = get_ctx().quote([norm(symbol)])[0]
     price = float(q.last_done)
     prev_close = float(q.prev_close)
 
-    # ✅ scan_setup يُنتج كل شيء (مع RVOL من 1H فقط داخل analysis.py)
+    df_weekly = candles_to_df(fetch_candles(symbol, "1w", 150), "1w")
+    df_daily  = candles_to_df(fetch_candles(symbol, "1d", 400), "1d")
+    df_4h     = candles_to_df(fetch_candles(symbol, "4h", 200), "4h")
+    df_1h     = candles_to_df(fetch_candles(symbol, "1h", 200), "1h")
+
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
     card = {
-        "color":  scan["color"],
-        "label":  scan["label"],
-        "score":  scan["score"],
-        "status": scan["status"],
-        "trend_w":  scan["trend_w"]["status"],
-        "trend_d":  scan["trend_d"]["status"],
-        "trend_4h": scan["trend_4h"]["status"],
-        "rvol":     scan["rvol"],   # من 1H فقط — كما في المواصفة
-        "sweep":    bool(scan.get("sweep")),
-        "fvg":      bool(scan.get("fvg")),
-        "rr":       scan["levels"].get("rr", 0),
+        "color":     scan["color"],
+        "label":     scan["label"],
+        "status":    scan["status"],
+        "direction": scan.get("direction"),
+        "stage":     scan.get("breakout_stage"),
     }
 
-    direction = scan["direction"] or "bullish"
-    levels = scan["levels"]
+    levels = scan.get("levels", {}) or {}
 
-    def tf_snap(df, label, use_ema200=False):
-        ts = trend_status(df, use_ema200=use_ema200)
-        r = df.iloc[-1]
-        return {
-            "label": label,
-            "trend": ts["status"],   # up / down / neutral
-            "reason": ts["reason"],
-            "ema20": round(float(r["ema20"]), 2),
-            "ema50": round(float(r["ema50"]), 2),
-            "rsi":   round(float(r["rsi"]), 1),
-            "adx":   round(float(r["adx"]), 1),
-            "rvol":  round(rvol(df), 2),
-        }
+    if scan["color"] in VALID_COLORS:
+        direction_opt = "bullish" if scan["color"] == "green" else "bearish"
+        opt = fetch_option_data(symbol, direction_opt, price, "swing")
+        levels["strike"]  = opt.get("strike", "—")
+        levels["expiry"]  = opt.get("expiry", "—")
+        levels["dte"]     = opt.get("dte", "—")
+        levels["premium"] = opt.get("premium", "—")
+    else:
+        opt = _empty_option_result()
 
-    timeframes = [
-        tf_snap(df_weekly, "1W", use_ema200=False),
-        tf_snap(df_daily,  "1D", use_ema200=True),
-        tf_snap(df_4h,     "4H", use_ema200=False),
-        tf_snap(df_1h,     "1H", use_ema200=False),
-    ]
-
-    opt = fetch_option_data(symbol, direction, price, "swing")
-    levels["strike"]  = opt.get("strike", "—")
-    levels["expiry"]  = opt.get("expiry", "—")
-    levels["dte"]     = opt.get("dte", "—")
-    levels["premium"] = opt.get("premium", "—")
-
-    supports = [
-        round(float(df_daily["low"].iloc[-20:].min()), 2),
-        round(float(df_weekly["low"].iloc[-4:].min()), 2),
-    ]
-    resistances = [
-        round(float(df_daily["high"].iloc[-20:].max()), 2),
-        round(float(df_weekly["high"].iloc[-4:].max()), 2),
-    ]
+    sr = scan.get("support_resistance", {})
+    timeframes = scan.get("timeframes", [])
 
     return {
         "symbol": symbol.upper(),
@@ -377,9 +566,8 @@ def analyze_symbol(symbol: str) -> dict:
         "card": card,
         "levels": levels,
         "timeframes": timeframes,
-        "vwap": round(float(df_1h["vwap"].iloc[-1]), 2),
-        "supports": supports,
-        "resistances": resistances,
+        "support_resistance": sr,
+        "break_info": scan.get("break_info", {}),
         "call_oi": opt.get("call_oi", []),
         "put_oi":  opt.get("put_oi", []),
         "total_call_oi":  opt.get("total_call_oi", 0),
@@ -387,6 +575,8 @@ def analyze_symbol(symbol: str) -> dict:
         "total_call_vol": opt.get("total_call_vol", 0),
         "total_put_vol":  opt.get("total_put_vol", 0),
         "whales": opt.get("whales", []),
+        "filter_pass": opt.get("filter_pass", False),
+        "filter_reason": opt.get("filter_reason", ""),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -407,27 +597,22 @@ def build_alert_message(data):
     sym = data["symbol"]; price = data["price"]
     card = data.get("card", {}); lv = data.get("levels", {})
     color = card.get("color", "gray")
-    if color not in ("green", "red"): return ""
+    if color not in ("green", "red"):
+        return ""
     header = f"🟢 <b>إشارة CALL</b> — {sym}" if color == "green" else f"🔴 <b>إشارة PUT</b> — {sym}"
 
     return f"""{header}
 
-💪 قوة الإشارة: <b>{card.get('score', 0)}%</b>
 💰 السعر: <b>${price}</b>
+📋 المرحلة: <b>{card.get('stage','—')}</b>
+⚖️ R:R: <b>{lv.get('rr','—')}</b>
 
-📊 <b>الاتجاه:</b>
-  • 1W: <b>{card.get('trend_w','—')}</b>
-  • 1D: <b>{card.get('trend_d','—')}</b>
-  • 4H: <b>{card.get('trend_4h','—')}</b>
-  • RVOL: <b>{card.get('rvol','—')}x</b>
-  • R:R: <b>{card.get('rr','—')}</b>
-
-📋 <b>العقد:</b>
+📊 <b>العقد:</b>
   • STRIKE: <b>{lv.get('strike','—')}</b>
   • EXPIRY: <b>{lv.get('expiry','—')}</b> (DTE: {lv.get('dte','—')})
   • PREMIUM: <b>${lv.get('premium','—')}</b>
 
-📊 <b>المستويات:</b>
+📈 <b>المستويات:</b>
   • ENTRY: ${lv.get('entry','—')}
   • STOP: ${lv.get('stop','—')}
   • TARGET: ${lv.get('target1','—')}
@@ -437,45 +622,30 @@ def build_alert_message(data):
 
 
 async def watchlist_checker():
-    global _sent_alerts, _last_color
     await asyncio.sleep(90)
-
     while True:
         try:
             symbols = list(_watchlist)
-            if symbols:
-                print(f"[WATCH] checking {len(symbols)}", flush=True)
-
             for sym in symbols:
                 try:
                     data = await asyncio.to_thread(analyze_symbol, sym)
                     _analyze_cache[sym.upper()] = (time.time(), data)
-
                     card = data.get("card", {})
                     color = card.get("color", "gray")
-
-                    _last_color[sym.upper()] = color
-
-                    if color not in ("green", "red"):
+                    if color not in VALID_COLORS:
                         continue
-
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                     alert_key = f"{sym}:{color}:{today}"
                     if alert_key in _sent_alerts:
                         continue
-
                     msg = build_alert_message(data)
                     if msg:
                         await asyncio.to_thread(send_telegram_alert, msg)
                         _sent_alerts.add(alert_key)
-                        print(f"[WATCH] alert → {sym} {color}", flush=True)
-
                 except Exception as e:
-                    print(f"[WATCH] {sym} error: {e}", flush=True)
-
+                    print(f"[WATCH] {sym}: {e}", flush=True)
         except Exception as e:
             print(f"[WATCH] fatal: {e}", flush=True)
-
         await asyncio.sleep(300)
 
 
@@ -483,11 +653,12 @@ async def watchlist_checker():
 async def lifespan(app: FastAPI):
     global _event_loop
     _event_loop = asyncio.get_running_loop()
-
     try:
         ctx = get_ctx()
         ctx.set_on_quote(_on_quote)
         print("[STARTUP] ready", flush=True)
+        if GEMINI_API_KEY:
+            print(f"[STARTUP] Gemini enabled — models: {GEMINI_MODELS}", flush=True)
     except Exception as e:
         print(f"[STARTUP] error: {e}", flush=True)
 
@@ -504,9 +675,7 @@ async def lifespan(app: FastAPI):
 
     ka = asyncio.create_task(keepalive())
     wc = asyncio.create_task(watchlist_checker())
-
     yield
-
     ka.cancel(); wc.cancel()
     global _quote_ctx
     _quote_ctx = None
@@ -537,6 +706,56 @@ def health():
 def test_telegram():
     ok = send_telegram_alert("✅ <b>اختبار ناجح</b>")
     return {"sent": ok, "configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)}
+
+
+@app.get("/api/test-gemini")
+def test_gemini():
+    if not GEMINI_API_KEY:
+        return {"ok": False, "reason": "GEMINI_API_KEY not set",
+                "models_tried": GEMINI_MODELS}
+    sample = {
+        "symbol": "TEST", "price": 100.0,
+        "card": {"color": "green", "stage": "daily_break_weekly"},
+        "levels": {"entry": 100, "stop": 98, "target1": 104, "rr": 2.0,
+                   "level_broken": 99, "pattern": "hammer"},
+        "break_info": {"rvol": 1.8},
+        "timeframes": [
+            {"label": "1W", "support": 95, "resistance": 99, "broke_resistance": True},
+            {"label": "1D", "support": 97, "resistance": 99, "broke_resistance": True},
+            {"label": "4H", "support": 98, "resistance": 101, "broke_resistance": False},
+            {"label": "1H", "support": 99, "resistance": 102, "broke_resistance": False},
+        ],
+    }
+    text = get_ai_analysis(sample)
+    return {"ok": bool(text), "text": text, "models_tried": GEMINI_MODELS}
+
+
+@app.get("/api/ai/{symbol}")
+async def ai_analysis(symbol: str):
+    if not GEMINI_API_KEY:
+        return {"ok": False, "reason": "no_key"}
+    sym = symbol.upper().strip()
+    if not sym:
+        return {"ok": False, "reason": "no_symbol"}
+
+    cached = _ai_cache.get(sym)
+    if cached and time.time() - cached[0] < _AI_CACHE_TTL:
+        return {"ok": True, "text": cached[1], "cached": True}
+
+    try:
+        data = await asyncio.to_thread(analyze_cached, sym)
+    except Exception as e:
+        return {"ok": False, "reason": f"analyze_error: {e}"}
+
+    if data.get("card", {}).get("color") not in VALID_COLORS:
+        return {"ok": False, "reason": "no_signal"}
+
+    try:
+        text = await asyncio.to_thread(get_ai_analysis, data)
+    except Exception as e:
+        return {"ok": False, "reason": f"ai_error: {e}"}
+
+    return {"ok": bool(text), "text": text}
 
 
 @app.get("/api/watchlist")
