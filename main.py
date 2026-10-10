@@ -423,7 +423,6 @@ def analyze_symbol(symbol):
 
     scan = scan_setup(df_weekly, df_daily, df_4h, df_1h)
 
-    # Legacy summary bar fields
     tfs = scan.get("timeframes", [])
     tfs_by = {t.get("label"): t for t in tfs}
     def tf_trend(t):
@@ -437,16 +436,14 @@ def analyze_symbol(symbol):
 
     levels = scan.get("levels", {}) or {}
 
-    # Options only for green/red
-    if scan["color"] in VALID_COLORS:
-        d_opt = "bullish" if scan["color"] == "green" else "bearish"
-        opt = fetch_option_data(symbol, d_opt, price, "swing")
-        levels["strike"]  = opt.get("strike", "—")
-        levels["expiry"]  = opt.get("expiry", "—")
-        levels["dte"]     = opt.get("dte", "—")
-        levels["premium"] = opt.get("premium", "—")
-    else:
-        opt = _empty_option_result()
+    # ✅ جلب العقود دائماً — حتى للرمادي والأصفر (السلوك الأصلي)
+    direction = scan["direction"] or "bullish"
+    opt = fetch_option_data(symbol, direction, price, "swing")
+
+    levels["strike"]  = opt.get("strike", "—")
+    levels["expiry"]  = opt.get("expiry", "—")
+    levels["dte"]     = opt.get("dte", "—")
+    levels["premium"] = opt.get("premium", "—")
 
     card = {
         "color": scan["color"],
