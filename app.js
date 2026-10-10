@@ -1,6 +1,6 @@
 /* ============================================================
    app.js — Longbridge Options Radar (Cascade Break & Retest)
-   البحث اليدوي + Gemini لكل البطاقات (رمادي/أصفر/أخضر/أحمر)
+   البحث اليدوي + Gemini + مربعات الاستراتيجية
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
@@ -8,12 +8,11 @@ const socketMap = new Map();
 const reconnectTimers = new Map();
 const stateTimers = new Map();
 let pollTimer = null;
-
 const lastAlertedState = {};
-
 const aiRequested = new Set();
 const aiQueue = [];
 let aiQueueRunning = false;
+const VALID_COLORS = ["green", "red"];
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -31,12 +30,6 @@ const themeBtn = document.getElementById("themeBtn");
 const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
-
-function trendLabel(t) {
-  if (t === "up") return "صاعد ↑";
-  if (t === "down") return "هابط ↓";
-  return "محايد —";
-}
 
 function playAlertSound(type) {
   try {
@@ -96,7 +89,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-/* ===== Gemini Queue ===== */
+/* Gemini */
 function enqueueAIRequest(symbol) {
   if (!symbol || aiRequested.has(symbol)) return;
   aiRequested.add(symbol);
@@ -130,7 +123,7 @@ async function runAIQueue() {
   aiQueueRunning = false;
 }
 
-/* ===== OI Block ===== */
+/* OI */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -156,7 +149,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
-/* ===== Whales ===== */
+/* Whales */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -236,14 +229,66 @@ function escapeHtml(s) {
     .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/* ===== Summary Bar ===== */
+/* ===== TF Box — مربعات الاستراتيجية ===== */
+function buildTFBox(tf) {
+  const label = tf.label || "—";
+  const kind = tf.kind || "neutral";
+  const state = tf.state || "inactive";
+
+  let boxClass = "tf-cell neutral";
+  let innerHtml = "";
+
+  if (kind === "reference") {
+    boxClass = "tf-cell neutral";
+    const valTxt = tf.value != null ? `$${Number(tf.value).toFixed(2)}` : "—";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-row"><span>${tf.title || ""}</span><span class="v">${valTxt}</span></div>
+      <div class="tf-row"><span class="tf-sub">${tf.sub || ""}</span></div>
+    `;
+  } else if (kind === "breakout") {
+    if (state === "broke_up") boxClass = "tf-cell up";
+    else if (state === "broke_down") boxClass = "tf-cell down";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
+  } else if (kind === "retest") {
+    if (state === "confirmed") boxClass = "tf-cell up";
+    else if (state === "invalidated") boxClass = "tf-cell down";
+    else if (state === "waiting_retest" || state === "retested" || state === "path2_waiting") boxClass = "tf-cell yellow";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
+  } else if (kind === "confirmation") {
+    if (state === "confirmed") boxClass = "tf-cell up";
+    else if (state === "waiting") boxClass = "tf-cell yellow";
+    else boxClass = "tf-cell neutral";
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">${tf.text || "—"}</div>
+    `;
+  } else {
+    innerHtml = `
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-state-txt">—</div>
+    `;
+  }
+
+  return `<div class="${boxClass}">${innerHtml}</div>`;
+}
+
+/* Summary Bar */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
   const label = c.label || "—";
   const stage = c.stage || "";
-  const stageTxt = stage === "daily_break_weekly" ? "اليومي اخترق الأسبوع"
-                 : stage === "4h_break_daily"     ? "4H اخترق اليوم" : "";
+  const stageTxt = stage === "daily_break_weekly" ? "اليومي / الأسبوعي"
+                 : stage === "4h_break_daily"     ? "4H / اليومي" : "";
   const pattern = cardData.levels?.pattern || "";
   const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
@@ -271,7 +316,6 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-/* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
   const lv = cardData.levels || {};
@@ -314,20 +358,8 @@ function buildCard(cardData) {
     <div class="cell"><div class="label">الدخول</div><div class="val">${lv.entry ? "$" + lv.entry : "—"}</div></div>
   </div>`;
 
-  const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => {
-    let tfCls = "neutral", statusTxt = "لم يُخترق";
-    if (t.broke_resistance) { tfCls = "up";   statusTxt = "مخترق ⬆"; }
-    else if (t.broke_support) { tfCls = "down"; statusTxt = "مكسور ⬇"; }
-    const resTxt = t.resistance != null ? "$" + t.resistance.toFixed(2) : "—";
-    const supTxt = t.support != null ? "$" + t.support.toFixed(2) : "—";
-    return `<div class="tf-cell ${tfCls}">
-      <div class="tf-label"><span>${t.label || ""}</span></div>
-      <div class="tf-row"><span>مقاومة</span><span class="v">${resTxt}</span></div>
-      <div class="tf-row"><span>دعم</span><span class="v">${supTxt}</span></div>
-      <div class="tf-row"><span>الحالة</span><span class="v">${statusTxt}</span></div>
-    </div>`;
-  }).join("");
+  const sboxes = cardData.strategy_boxes || [];
+  const tfsHtml = sboxes.map(t => buildTFBox(t)).join("");
 
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
@@ -365,10 +397,7 @@ function buildCard(cardData) {
     e.stopPropagation(); deleteCard(sym);
   });
 
-  // ✅ Gemini لكل البطاقات — بما فيها الرمادي والأصفر
-  if (!cardData.ai_analysis) {
-    enqueueAIRequest(sym);
-  }
+  if (!cardData.ai_analysis) enqueueAIRequest(sym);
 
   return div;
 }
@@ -409,20 +438,8 @@ function updateCardInPlace(cardEl, data) {
 
   const tfGrid = cardEl.querySelector(".tf-grid");
   if (tfGrid) {
-    const tfs = data.timeframes || [];
-    tfGrid.innerHTML = tfs.map(t => {
-      let tfCls = "neutral", statusTxt = "لم يُخترق";
-      if (t.broke_resistance) { tfCls = "up"; statusTxt = "مخترق ⬆"; }
-      else if (t.broke_support) { tfCls = "down"; statusTxt = "مكسور ⬇"; }
-      const resTxt = t.resistance != null ? "$" + t.resistance.toFixed(2) : "—";
-      const supTxt = t.support != null ? "$" + t.support.toFixed(2) : "—";
-      return `<div class="tf-cell ${tfCls}">
-        <div class="tf-label"><span>${t.label || ""}</span></div>
-        <div class="tf-row"><span>مقاومة</span><span class="v">${resTxt}</span></div>
-        <div class="tf-row"><span>دعم</span><span class="v">${supTxt}</span></div>
-        <div class="tf-row"><span>الحالة</span><span class="v">${statusTxt}</span></div>
-      </div>`;
-    }).join("");
+    const sboxes = data.strategy_boxes || [];
+    tfGrid.innerHTML = sboxes.map(t => buildTFBox(t)).join("");
   }
   updateAllDynamic(cardEl, sym, data);
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
@@ -573,7 +590,6 @@ searchForm.addEventListener("submit", (e) => {
   cards.forEach(c => {
     connectLive(c.symbol);
     startStatePolling(c.symbol);
-    // ✅ Gemini لكل البطاقات المحفوظة
     if (!c.ai_analysis) enqueueAIRequest(c.symbol);
   });
   setTimeout(() => {
