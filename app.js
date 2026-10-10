@@ -1,20 +1,19 @@
 /* ============================================================
    app.js — Longbridge Options Radar (Cascade Break & Retest)
-   تصميم بطاقة مطابق لـ stock-scanner + بحث يدوي + Gemini
+   الأصلي محفوظ + Gemini queue + دعم الأصفر والرمادي
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
 const reconnectTimers = new Map();
 const stateTimers = new Map();
+let pollTimer = null;
+
 const lastAlertedState = {};
 
-// Gemini async queue
 const aiRequested = new Set();
 const aiQueue = [];
 let aiQueueRunning = false;
-
-const VALID_COLORS = ["green", "red"];
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -22,11 +21,6 @@ function saveCards() {
 function loadCards() {
   try { const r = localStorage.getItem("stock_cards"); return r ? JSON.parse(r) : []; }
   catch (e) { return []; }
-}
-function escapeHtml(s) {
-  return String(s)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 const cardsArea = document.getElementById("cardsArea");
@@ -37,6 +31,12 @@ const themeBtn = document.getElementById("themeBtn");
 const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
+
+function trendLabel(t) {
+  if (t === "up") return "صاعد ↑";
+  if (t === "down") return "هابط ↓";
+  return "محايد —";
+}
 
 function playAlertSound(type) {
   try {
@@ -96,13 +96,7 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
-function stageLabel(stage) {
-  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوع";
-  if (stage === "4h_break_daily")     return "4H اخترق اليوم";
-  return "";
-}
-
-/* ===== Gemini Queue ===== */
+/* Gemini */
 function enqueueAIRequest(symbol) {
   if (!symbol || aiRequested.has(symbol)) return;
   aiRequested.add(symbol);
@@ -136,7 +130,7 @@ async function runAIQueue() {
   aiQueueRunning = false;
 }
 
-/* ===== OI Block ===== */
+/* OI */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -158,33 +152,24 @@ function updateOIBlockData(root, kind, data) {
     if (i < data.length) {
       bar.style.width = `${((data[i].oi || 0) / maxOI) * 100}%`;
       strike.textContent = data[i].strike;
-    } else {
-      bar.style.width = "0%";
-      strike.textContent = "—";
-    }
+    } else { bar.style.width = "0%"; strike.textContent = "—"; }
   }
 }
 
-/* ===== Whales ===== */
+/* Whales */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
     rows += `<div class="whale-pill" data-whale-row="${sym}-${i}" style="display:none;">
-      <span class="whale-type" data-whale-type="${sym}-${i}">—</span>
-      <span class="whale-sep">·</span>
-      <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span>
-      <span class="whale-sep">·</span>
-      <span class="whale-vol">حجم <b data-whale-vol="${sym}-${i}">—</b></span>
-      <span class="whale-sep">·</span>
-      <span class="whale-oi">مفتوحة <b data-whale-oi="${sym}-${i}">—</b></span>
-      <span class="whale-sep">·</span>
+      <span class="whale-type" data-whale-type="${sym}-${i}">—</span><span class="whale-sep">·</span>
+      <span class="whale-strike" data-whale-strike="${sym}-${i}">—</span><span class="whale-sep">·</span>
+      <span class="whale-vol">حجم <b data-whale-vol="${sym}-${i}">—</b></span><span class="whale-sep">·</span>
+      <span class="whale-oi">مفتوحة <b data-whale-oi="${sym}-${i}">—</b></span><span class="whale-sep">·</span>
       <span class="whale-dir" data-whale-dir="${sym}-${i}">—</span>
     </div>`;
   }
   return `<div class="whales-section" id="whales-${sym}" style="display:none;">
-    <div class="whales-title">🐋 الحيتان المكتشفة</div>
-    <div class="whales-list">${rows}</div>
-  </div>`;
+    <div class="whales-title">🐋 الحيتان المكتشفة</div><div class="whales-list">${rows}</div></div>`;
 }
 function updateWhalesData(root, sym, whales) {
   if (!root) return;
@@ -212,98 +197,68 @@ function updateWhalesData(root, sym, whales) {
       if (vol) vol.textContent = volFmt;
       if (oi)  oi.textContent  = oiFmt;
       if (dir) dir.textContent = w.direction === "buy" ? "🟢 يشتري"
-                              : w.direction === "sell" ? "🔴 يبيع"
-                              : "⚪ محايد";
-    } else {
-      row.style.display = "none";
-    }
+                              : w.direction === "sell" ? "🔴 يبيع" : "⚪ محايد";
+    } else { row.style.display = "none"; }
   }
 }
 
-/* ===== Put/Call Boxes ===== */
 function updatePutCallBoxes(root, sym, card) {
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
+  const callOI = card.call_oi || [], putOI = card.put_oi || [];
   const tCOI = callOI.reduce((s, x) => s + (x.oi || 0), 0);
   const tPOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
-  const tCV  = callOI.reduce((s, x) => s + (x.volume || 0), 0);
-  const tPV  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
-  const totOI = tCOI + tPOI;
-  const totV  = tCV + tPV;
+  const tCV = callOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const tPV = putOI.reduce((s, x) => s + (x.volume || 0), 0);
+  const totOI = tCOI + tPOI, totV = tCV + tPV;
   const callOITxt  = totOI > 0 ? Math.round(tCOI / totOI * 100) + "%" : "—";
   const putOITxt   = totOI > 0 ? Math.round(tPOI / totOI * 100) + "%" : "—";
   const callVolTxt = totV  > 0 ? Math.round(tCV  / totV  * 100) + "%" : "—";
   const putVolTxt  = totV  > 0 ? Math.round(tPV  / totV  * 100) + "%" : "—";
   const set = (id, val) => { const el = root.querySelector(`#${id}-${sym}`); if (el) el.textContent = val; };
-  set("pcbox-call-oi",  callOITxt);
-  set("pcbox-put-oi",   putOITxt);
+  set("pcbox-call-oi", callOITxt);
+  set("pcbox-put-oi", putOITxt);
   set("pcbox-call-vol", callVolTxt);
-  set("pcbox-put-vol",  putVolTxt);
+  set("pcbox-put-vol", putVolTxt);
 }
 
-/* ===== TF Box ===== */
-function buildTFBox(tf) {
-  const label = tf.label || "—";
-  const support = tf.support;
-  const resistance = tf.resistance;
-  const brokeRes = !!tf.broke_resistance;
-  const brokeSup = !!tf.broke_support;
-
-  let statusHtml = "";
-  let boxClass = "tf-cell neutral";
-
-  if (brokeRes) {
-    boxClass = "tf-cell up";
-    statusHtml = `<div class="tf-status tf-broke-up">مخترق ⬆</div>`;
-  } else if (brokeSup) {
-    boxClass = "tf-cell down";
-    statusHtml = `<div class="tf-status tf-broke-down">مكسور ⬇</div>`;
-  } else {
-    statusHtml = `<div class="tf-status tf-no">لم يُخترق</div>`;
-  }
-
-  const supTxt = support != null ? `$${support.toFixed(2)}` : "—";
-  const resTxt = resistance != null ? `$${resistance.toFixed(2)}` : "—";
-
-  return `
-    <div class="${boxClass}">
-      <div class="tf-label"><span>${label}</span></div>
-      <div class="tf-line"><span class="tf-k">مقاومة</span><span class="tf-v">${resTxt}</span></div>
-      <div class="tf-line"><span class="tf-k">دعم</span><span class="tf-v">${supTxt}</span></div>
-      ${statusHtml}
-    </div>
-  `;
+function updateAllDynamic(root, sym, card) {
+  if (!root || !card) return;
+  const callOI = card.call_oi || [], putOI = card.put_oi || [];
+  updateOIBlockData(root, "put-oi",   putOI);
+  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updateOIBlockData(root, "call-oi",  callOI);
+  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updatePutCallBoxes(root, sym, card);
+  updateWhalesData(root, sym, card.whales || []);
 }
 
-/* ===== Summary Bar ===== */
+/* Summary bar — Cascade */
 function buildSummaryBar(cardData) {
   const c = cardData.card || {};
   const color = c.color || "gray";
   const label = c.label || "—";
-  const stage = c.stage ? stageLabel(c.stage) : "";
+  const stage = c.stage || "";
+  const stageTxt = stage === "daily_break_weekly" ? "اليومي اخترق الأسبوع"
+                 : stage === "4h_break_daily"     ? "4H اخترق اليوم" : "";
+  const pattern = cardData.levels?.pattern || "";
   const rr = cardData.levels?.rr ?? "—";
   const rrOk = typeof rr === "number" && rr >= 2.0;
-  const pattern = cardData.levels?.pattern || "";
   const aiText = (cardData.ai_analysis || "").trim();
 
   const aiBlock = aiText ? `
-    <div class="ai-analysis" style="width:100%;text-align:right;direction:rtl;
-         font-size:12.5px;line-height:1.85;color:var(--text);
-         padding:4px 6px 10px;border-bottom:1px dashed rgba(255,255,255,0.12);
-         margin-bottom:8px;white-space:pre-wrap;font-weight:500;">
-      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);
-                  margin-bottom:4px;">🤖 تحليل ذكي</div>
+    <div style="width:100%;text-align:right;direction:rtl;font-size:12.5px;
+         line-height:1.85;color:var(--text);padding:4px 6px 10px;
+         border-bottom:1px dashed rgba(255,255,255,0.12);margin-bottom:8px;
+         white-space:pre-wrap;font-weight:500;">
+      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);margin-bottom:4px;">🤖 تحليل ذكي</div>
       ${escapeHtml(aiText)}
     </div>` : "";
 
   return `
-    <div class="summary-bar" style="flex-direction:column;align-items:stretch;
-         border-radius:14px;padding:12px 14px;">
+    <div class="summary-bar" style="flex-direction:column;align-items:stretch;border-radius:14px;padding:12px 14px;">
       ${aiBlock}
-      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;
-                  justify-content:center;align-items:center;">
+      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;justify-content:center;align-items:center;">
         <span class="summary-badge badge-${color}">${label}</span>
-        ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
+        ${stageTxt ? `<span class="summary-item">${stageTxt}</span><span class="summary-sep">·</span>` : ""}
         ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
         <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
       </div>
@@ -311,13 +266,15 @@ function buildSummaryBar(cardData) {
   `;
 }
 
-/* ===== Build Card ===== */
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
 function buildCard(cardData) {
   const c = cardData.card || {};
-  if (!VALID_COLORS.includes(c.color)) return null;
-
   const lv = cardData.levels || {};
-  const cls = c.color;
+  const cls = c.color || "gray";   // ← يظهر الرمادي والأصفر
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
 
@@ -329,18 +286,12 @@ function buildCard(cardData) {
 
   const row1 = `<div class="card-row row-1">
     <div class="cell symbol-cell">${sym}</div>
-    <div class="cell price-cell">
-      <div class="val" data-price>$${price.toFixed(2)}</div>
-      <div class="sub">السعر الحالي</div>
-    </div>
-    <div class="cell score-cell">
-      <div class="val" data-score>${lv.rr ?? "—"}</div>
-      <div class="sub">R:R</div>
-    </div>
+    <div class="cell price-cell"><div class="val" data-price>$${price.toFixed(2)}</div><div class="sub">السعر الحالي</div></div>
+    <div class="cell score-cell"><div class="val" data-score>${lv.rr ?? "—"}</div><div class="sub">R:R</div></div>
     <div class="cell badge-cell">
       <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
-      <button class="card-trash" data-trash>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="card-trash">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="3 6 5 6 21 6"></polyline>
           <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
         </svg>
@@ -363,7 +314,19 @@ function buildCard(cardData) {
   </div>`;
 
   const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map(t => buildTFBox(t)).join("");
+  const tfsHtml = tfs.map(t => {
+    let tfCls = "neutral", statusTxt = "لم يُخترق";
+    if (t.broke_resistance) { tfCls = "up";   statusTxt = "مخترق ⬆"; }
+    else if (t.broke_support) { tfCls = "down"; statusTxt = "مكسور ⬇"; }
+    const resTxt = t.resistance != null ? "$" + t.resistance.toFixed(2) : "—";
+    const supTxt = t.support != null ? "$" + t.support.toFixed(2) : "—";
+    return `<div class="tf-cell ${tfCls}">
+      <div class="tf-label"><span>${t.label || ""}</span></div>
+      <div class="tf-row"><span>مقاومة</span><span class="v">${resTxt}</span></div>
+      <div class="tf-row"><span>دعم</span><span class="v">${supTxt}</span></div>
+      <div class="tf-row"><span>الحالة</span><span class="v">${statusTxt}</span></div>
+    </div>`;
+  }).join("");
 
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
@@ -374,22 +337,10 @@ function buildCard(cardData) {
 
   const boxesHtml = `
     <div class="putcall-boxes">
-      <div class="pcbox pcbox-call">
-        <div class="pcbox-label">مفتوحة - CALL</div>
-        <div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-put">
-        <div class="pcbox-label">مفتوحة - PUT</div>
-        <div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-call">
-        <div class="pcbox-label">حجم - CALL</div>
-        <div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div>
-      </div>
-      <div class="pcbox pcbox-put">
-        <div class="pcbox-label">حجم - PUT</div>
-        <div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div>
-      </div>
+      <div class="pcbox pcbox-call"><div class="pcbox-label">مفتوحة - CALL</div><div class="pcbox-pct" id="pcbox-call-oi-${sym}">—</div></div>
+      <div class="pcbox pcbox-put"><div class="pcbox-label">مفتوحة - PUT</div><div class="pcbox-pct" id="pcbox-put-oi-${sym}">—</div></div>
+      <div class="pcbox pcbox-call"><div class="pcbox-label">حجم - CALL</div><div class="pcbox-pct" id="pcbox-call-vol-${sym}">—</div></div>
+      <div class="pcbox pcbox-put"><div class="pcbox-label">حجم - PUT</div><div class="pcbox-pct" id="pcbox-put-vol-${sym}">—</div></div>
     </div>`;
 
   const whalesHtml = buildWhalesStatic(sym);
@@ -406,45 +357,37 @@ function buildCard(cardData) {
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
-    if (e.target.closest("[data-trash]")) return;
+    if (e.target.closest(".card-trash")) return;
     div.classList.toggle("open");
   });
-  div.querySelector("[data-trash]").addEventListener("click", (e) => {
+  div.querySelector(".card-trash").addEventListener("click", (e) => {
     e.stopPropagation(); deleteCard(sym);
   });
 
-  if (!cardData.ai_analysis) enqueueAIRequest(sym);
-  return div;
-}
+  // Gemini only for green/red
+  if (!cardData.ai_analysis && (cls === "green" || cls === "red")) {
+    enqueueAIRequest(sym);
+  }
 
-function updateAllDynamic(root, sym, card) {
-  if (!root || !card) return;
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
-  updateOIBlockData(root, "put-oi",   putOI);
-  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updateOIBlockData(root, "call-oi",  callOI);
-  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updatePutCallBoxes(root, sym, card);
-  updateWhalesData(root, sym, card.whales || []);
+  return div;
 }
 
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
-  if (!VALID_COLORS.includes(c.color)) { cardEl.remove(); return; }
   const lv = data.levels || {};
+  const sym = data.symbol;
   const price = data.price ?? 0;
 
   const wasOpen = cardEl.classList.contains("open");
-  const newCls = "card " + c.color + (wasOpen ? " open" : "");
-  if (cardEl.className !== newCls) cardEl.className = newCls;
+  cardEl.className = "card " + (c.color || "gray");
+  if (wasOpen) cardEl.classList.add("open");
 
+  const badge = cardEl.querySelector("[data-badge]");
+  if (badge) badge.textContent = "🔥 " + (c.label || "—");
+  const score = cardEl.querySelector("[data-score]");
+  if (score) score.textContent = lv.rr ?? "—";
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
-  const scoreEl = cardEl.querySelector("[data-score]");
-  if (scoreEl) scoreEl.textContent = lv.rr ?? "—";
-  const badgeEl = cardEl.querySelector("[data-badge]");
-  if (badgeEl) badgeEl.textContent = "🔥 " + (c.label || "—");
 
   const row2 = cardEl.querySelector(".row-2");
   if (row2) {
@@ -462,12 +405,25 @@ function updateCardInPlace(cardEl, data) {
     if (cells[2]) cells[2].textContent = lv.target1 ? "$" + lv.target1 : "—";
     if (cells[3]) cells[3].textContent = lv.entry ? "$" + lv.entry : "—";
   }
+
   const tfGrid = cardEl.querySelector(".tf-grid");
   if (tfGrid) {
     const tfs = data.timeframes || [];
-    tfGrid.innerHTML = tfs.map(t => buildTFBox(t)).join("");
+    tfGrid.innerHTML = tfs.map(t => {
+      let tfCls = "neutral", statusTxt = "لم يُخترق";
+      if (t.broke_resistance) { tfCls = "up"; statusTxt = "مخترق ⬆"; }
+      else if (t.broke_support) { tfCls = "down"; statusTxt = "مكسور ⬇"; }
+      const resTxt = t.resistance != null ? "$" + t.resistance.toFixed(2) : "—";
+      const supTxt = t.support != null ? "$" + t.support.toFixed(2) : "—";
+      return `<div class="tf-cell ${tfCls}">
+        <div class="tf-label"><span>${t.label || ""}</span></div>
+        <div class="tf-row"><span>مقاومة</span><span class="v">${resTxt}</span></div>
+        <div class="tf-row"><span>دعم</span><span class="v">${supTxt}</span></div>
+        <div class="tf-row"><span>الحالة</span><span class="v">${statusTxt}</span></div>
+      </div>`;
+    }).join("");
   }
-  updateAllDynamic(cardEl, data.symbol, data);
+  updateAllDynamic(cardEl, sym, data);
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
   if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
 }
@@ -478,33 +434,28 @@ function rebuildCard(symbol, newData) {
   const old = cards[idx];
   const merged = { ...newData };
   if (!newData.call_oi || newData.call_oi.length === 0) merged.call_oi = old.call_oi || [];
-  if (!newData.put_oi  || newData.put_oi.length === 0)  merged.put_oi  = old.put_oi  || [];
-  if (!newData.whales  || newData.whales.length === 0)  merged.whales  = old.whales  || [];
+  if (!newData.put_oi || newData.put_oi.length === 0)   merged.put_oi = old.put_oi || [];
+  if (!newData.whales || newData.whales.length === 0)   merged.whales = old.whales || [];
   if (!newData.ai_analysis && old.ai_analysis)          merged.ai_analysis = old.ai_analysis;
   cards[idx] = merged;
   const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
   if (!el) return;
-  if (!VALID_COLORS.includes((newData.card||{}).color)) {
-    el.remove();
-  } else {
-    updateCardInPlace(el, merged);
-  }
+  updateCardInPlace(el, merged);
   saveCards();
 }
 
 function renderCards() {
   cardsArea.innerHTML = "";
   emptyState.style.display = cards.length ? "none" : "block";
+  // ترتيب: أخضر/أحمر → أصفر → رمادي
+  const order = { green: 0, red: 0, yellow: 1, gray: 2 };
   const sorted = [...cards].sort((a, b) => {
-    const ga = a.card?.color === "gray" ? -1 : 0;
-    const gb = b.card?.color === "gray" ? -1 : 0;
-    if (ga !== gb) return gb - ga;
+    const oa = order[a.card?.color] ?? 3;
+    const ob = order[b.card?.color] ?? 3;
+    if (oa !== ob) return oa - ob;
     return (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0);
   });
-  sorted.forEach(c => {
-    const el = buildCard(c);
-    if (el) cardsArea.appendChild(el);
-  });
+  sorted.forEach(c => cardsArea.appendChild(buildCard(c)));
 }
 
 async function searchSymbol(symbol) {
@@ -549,10 +500,10 @@ function updateCardPrice(symbol, price) {
   if (!card) return;
   if (price && price > 0 && price !== card.price) {
     card.price = price;
-    const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-    if (!el) return;
-    const p = el.querySelector("[data-price]");
-    if (p) p.textContent = "$" + parseFloat(price).toFixed(2);
+    const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+    if (!cardEl) return;
+    const priceEl = cardEl.querySelector("[data-price]");
+    if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
   }
 }
 
@@ -622,11 +573,14 @@ searchForm.addEventListener("submit", (e) => {
   cards.forEach(c => {
     connectLive(c.symbol);
     startStatePolling(c.symbol);
-    if (!c.ai_analysis) enqueueAIRequest(c.symbol);
+    const color = c.card?.color;
+    if (!c.ai_analysis && (color === "green" || color === "red")) enqueueAIRequest(c.symbol);
   });
-  setTimeout(() => cards.forEach(c => fetchState(c.symbol)), 2000);
+  setTimeout(() => {
+    cards.forEach(c => fetchState(c.symbol));
+  }, 2000);
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
   setTimeout(pollPrices, 3000);
-  setInterval(pollPrices, 5000);
+  pollTimer = setInterval(pollPrices, 5000);
 })();
