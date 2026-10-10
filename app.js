@@ -1,14 +1,20 @@
 /* ============================================================
-   app.js — Longbridge Options Radar (Sweep + FVG)
+   app.js — Longbridge Options Radar (Cascade Break & Retest)
+   تصميم بطاقة مطابق لـ stock-scanner + بحث يدوي + Gemini
    ============================================================ */
 const API_BASE = window.location.origin;
 let cards = [];
 const socketMap = new Map();
 const reconnectTimers = new Map();
 const stateTimers = new Map();
-let pollTimer = null;
-
 const lastAlertedState = {};
+
+// Gemini async queue
+const aiRequested = new Set();
+const aiQueue = [];
+let aiQueueRunning = false;
+
+const VALID_COLORS = ["green", "red"];
 
 function saveCards() {
   try { localStorage.setItem("stock_cards", JSON.stringify(cards)); } catch (e) {}
@@ -16,6 +22,11 @@ function saveCards() {
 function loadCards() {
   try { const r = localStorage.getItem("stock_cards"); return r ? JSON.parse(r) : []; }
   catch (e) { return []; }
+}
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 const cardsArea = document.getElementById("cardsArea");
@@ -26,13 +37,6 @@ const themeBtn = document.getElementById("themeBtn");
 const themeIcon = document.getElementById("themeIcon");
 const marketStatus = document.getElementById("marketStatus");
 const connectionStatus = document.getElementById("connectionStatus");
-
-/* ✅ ترجمة حالة الاتجاه */
-function trendLabel(t) {
-  if (t === "up") return "صاعد ↑";
-  if (t === "down") return "هابط ↓";
-  return "محايد —";
-}
 
 function playAlertSound(type) {
   try {
@@ -51,7 +55,6 @@ function playAlertSound(type) {
     });
   } catch (e) {}
 }
-
 function checkSound(symbol, color) {
   const prev = lastAlertedState[symbol];
   if ((color === "green" || color === "red") && prev !== color) playAlertSound(color);
@@ -93,6 +96,47 @@ async function checkBackendStatus() {
   } catch (e) { setConnection(false); }
 }
 
+function stageLabel(stage) {
+  if (stage === "daily_break_weekly") return "اليومي اخترق الأسبوع";
+  if (stage === "4h_break_daily")     return "4H اخترق اليوم";
+  return "";
+}
+
+/* ===== Gemini Queue ===== */
+function enqueueAIRequest(symbol) {
+  if (!symbol || aiRequested.has(symbol)) return;
+  aiRequested.add(symbol);
+  aiQueue.push(symbol);
+  if (!aiQueueRunning) runAIQueue();
+}
+async function runAIQueue() {
+  aiQueueRunning = true;
+  while (aiQueue.length > 0) {
+    const sym = aiQueue.shift();
+    try {
+      const r = await fetch(`${API_BASE}/api/ai/${sym}`);
+      if (r.ok) {
+        const d = await r.json();
+        if (d.ok && d.text) {
+          const card = cards.find(c => c.symbol === sym);
+          if (card) {
+            card.ai_analysis = d.text;
+            const el = cardsArea.querySelector(`[data-symbol="${sym}"]`);
+            if (el) {
+              const sumWrap = el.querySelector("[data-summary-wrap]");
+              if (sumWrap) sumWrap.innerHTML = buildSummaryBar(card);
+            }
+            saveCards();
+          }
+        }
+      }
+    } catch (e) {}
+    await new Promise(r => setTimeout(r, 800));
+  }
+  aiQueueRunning = false;
+}
+
+/* ===== OI Block ===== */
 function buildOIBlockStatic(title, kind, color) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -103,7 +147,6 @@ function buildOIBlockStatic(title, kind, color) {
   }
   return `<div class="oi-box"><div class="oi-title">${title}</div><div class="oi-rows">${rows}</div></div>`;
 }
-
 function updateOIBlockData(root, kind, data) {
   if (!root) return;
   data = data || [];
@@ -122,6 +165,7 @@ function updateOIBlockData(root, kind, data) {
   }
 }
 
+/* ===== Whales ===== */
 function buildWhalesStatic(sym) {
   let rows = "";
   for (let i = 0; i < 5; i++) {
@@ -142,7 +186,6 @@ function buildWhalesStatic(sym) {
     <div class="whales-list">${rows}</div>
   </div>`;
 }
-
 function updateWhalesData(root, sym, whales) {
   if (!root) return;
   const wrap = root.querySelector(`#whales-${sym}`);
@@ -150,25 +193,20 @@ function updateWhalesData(root, sym, whales) {
   whales = whales || [];
   if (whales.length === 0) { wrap.style.display = "none"; return; }
   wrap.style.display = "block";
-
   for (let i = 0; i < 5; i++) {
     const row = root.querySelector(`[data-whale-row="${sym}-${i}"]`);
     if (!row) continue;
-
     if (i < whales.length) {
       const w = whales[i];
       row.style.display = "inline-flex";
       row.className = "whale-pill " + (w.type === "CALL" ? "whale-call" : "whale-put");
-
       const type = row.querySelector(`[data-whale-type="${sym}-${i}"]`);
       const strike = row.querySelector(`[data-whale-strike="${sym}-${i}"]`);
       const vol = row.querySelector(`[data-whale-vol="${sym}-${i}"]`);
       const oi = row.querySelector(`[data-whale-oi="${sym}-${i}"]`);
       const dir = row.querySelector(`[data-whale-dir="${sym}-${i}"]`);
-
       if (type) type.textContent = w.type;
       if (strike) strike.textContent = w.strike;
-
       const volFmt = w.volume >= 1000 ? (w.volume / 1000).toFixed(1) + "K" : w.volume;
       const oiFmt  = w.oi >= 1000 ? (w.oi / 1000).toFixed(1) + "K" : w.oi;
       if (vol) vol.textContent = volFmt;
@@ -182,6 +220,7 @@ function updateWhalesData(root, sym, whales) {
   }
 }
 
+/* ===== Put/Call Boxes ===== */
 function updatePutCallBoxes(root, sym, card) {
   const callOI = card.call_oi || [];
   const putOI  = card.put_oi  || [];
@@ -189,75 +228,96 @@ function updatePutCallBoxes(root, sym, card) {
   const tPOI = putOI.reduce((s, x) => s + (x.oi || 0), 0);
   const tCV  = callOI.reduce((s, x) => s + (x.volume || 0), 0);
   const tPV  = putOI.reduce((s, x) => s + (x.volume || 0), 0);
-
   const totOI = tCOI + tPOI;
   const totV  = tCV + tPV;
-
   const callOITxt  = totOI > 0 ? Math.round(tCOI / totOI * 100) + "%" : "—";
   const putOITxt   = totOI > 0 ? Math.round(tPOI / totOI * 100) + "%" : "—";
   const callVolTxt = totV  > 0 ? Math.round(tCV  / totV  * 100) + "%" : "—";
   const putVolTxt  = totV  > 0 ? Math.round(tPV  / totV  * 100) + "%" : "—";
-
-  const set = (id, val) => {
-    const el = root.querySelector(`#${id}-${sym}`);
-    if (el) el.textContent = val;
-  };
+  const set = (id, val) => { const el = root.querySelector(`#${id}-${sym}`); if (el) el.textContent = val; };
   set("pcbox-call-oi",  callOITxt);
   set("pcbox-put-oi",   putOITxt);
   set("pcbox-call-vol", callVolTxt);
   set("pcbox-put-vol",  putVolTxt);
 }
 
-function updateAllDynamic(root, sym, card) {
-  if (!root || !card) return;
-  const callOI = card.call_oi || [];
-  const putOI  = card.put_oi  || [];
-  updateOIBlockData(root, "put-oi",   putOI);
-  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updateOIBlockData(root, "call-oi",  callOI);
-  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
-  updatePutCallBoxes(root, sym, card);
-  updateWhalesData(root, sym, card.whales || []);
-}
+/* ===== TF Box ===== */
+function buildTFBox(tf) {
+  const label = tf.label || "—";
+  const support = tf.support;
+  const resistance = tf.resistance;
+  const brokeRes = !!tf.broke_resistance;
+  const brokeSup = !!tf.broke_support;
 
-/* ✅ الشريط السفلي — الاتجاهات + RVOL + R:R */
-function buildSummaryBar(cardData) {
-  const c = cardData.card || {};
-  const color = c.color || "gray";
-  const label = c.label || "—";
+  let statusHtml = "";
+  let boxClass = "tf-cell neutral";
 
-  const tw = c.trend_w  || "neutral";
-  const td = c.trend_d  || "neutral";
-  const t4 = c.trend_4h || "neutral";
+  if (brokeRes) {
+    boxClass = "tf-cell up";
+    statusHtml = `<div class="tf-status tf-broke-up">مخترق ⬆</div>`;
+  } else if (brokeSup) {
+    boxClass = "tf-cell down";
+    statusHtml = `<div class="tf-status tf-broke-down">مكسور ⬇</div>`;
+  } else {
+    statusHtml = `<div class="tf-status tf-no">لم يُخترق</div>`;
+  }
 
-  const twIcon = tw === "up" ? "🟢" : tw === "down" ? "🔴" : "⚪";
-  const tdIcon = td === "up" ? "🟢" : td === "down" ? "🔴" : "⚪";
-  const t4Icon = t4 === "up" ? "🟢" : t4 === "down" ? "🔴" : "⚪";
-
-  const rvol = c.rvol ?? "—";
-  const rr   = c.rr ?? "—";
-  const rrOk = typeof rr === "number" && rr >= 2.0;
+  const supTxt = support != null ? `$${support.toFixed(2)}` : "—";
+  const resTxt = resistance != null ? `$${resistance.toFixed(2)}` : "—";
 
   return `
-    <div class="summary-bar">
-      <span class="summary-badge badge-${color}">${label}</span>
-      <span class="summary-item">1W ${twIcon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">1D ${tdIcon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">4H ${t4Icon}</span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">RVOL <b>${rvol}</b></span>
-      <span class="summary-sep">·</span>
-      <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
+    <div class="${boxClass}">
+      <div class="tf-label"><span>${label}</span></div>
+      <div class="tf-line"><span class="tf-k">مقاومة</span><span class="tf-v">${resTxt}</span></div>
+      <div class="tf-line"><span class="tf-k">دعم</span><span class="tf-v">${supTxt}</span></div>
+      ${statusHtml}
     </div>
   `;
 }
 
+/* ===== Summary Bar ===== */
+function buildSummaryBar(cardData) {
+  const c = cardData.card || {};
+  const color = c.color || "gray";
+  const label = c.label || "—";
+  const stage = c.stage ? stageLabel(c.stage) : "";
+  const rr = cardData.levels?.rr ?? "—";
+  const rrOk = typeof rr === "number" && rr >= 2.0;
+  const pattern = cardData.levels?.pattern || "";
+  const aiText = (cardData.ai_analysis || "").trim();
+
+  const aiBlock = aiText ? `
+    <div class="ai-analysis" style="width:100%;text-align:right;direction:rtl;
+         font-size:12.5px;line-height:1.85;color:var(--text);
+         padding:4px 6px 10px;border-bottom:1px dashed rgba(255,255,255,0.12);
+         margin-bottom:8px;white-space:pre-wrap;font-weight:500;">
+      <div style="font-size:10.5px;font-weight:700;color:var(--text-muted);
+                  margin-bottom:4px;">🤖 تحليل ذكي</div>
+      ${escapeHtml(aiText)}
+    </div>` : "";
+
+  return `
+    <div class="summary-bar" style="flex-direction:column;align-items:stretch;
+         border-radius:14px;padding:12px 14px;">
+      ${aiBlock}
+      <div style="display:flex;flex-wrap:wrap;gap:6px 8px;
+                  justify-content:center;align-items:center;">
+        <span class="summary-badge badge-${color}">${label}</span>
+        ${stage ? `<span class="summary-item">${stage}</span><span class="summary-sep">·</span>` : ""}
+        ${pattern && pattern !== "none" ? `<span class="summary-item">${pattern}</span><span class="summary-sep">·</span>` : ""}
+        <span class="summary-item">R:R <b>${rr}</b> ${rrOk ? "✅" : "⚠️"}</span>
+      </div>
+    </div>
+  `;
+}
+
+/* ===== Build Card ===== */
 function buildCard(cardData) {
   const c = cardData.card || {};
+  if (!VALID_COLORS.includes(c.color)) return null;
+
   const lv = cardData.levels || {};
-  const cls = c.color || "gray";
+  const cls = c.color;
   const price = cardData.price ?? 0;
   const sym = cardData.symbol;
 
@@ -274,13 +334,13 @@ function buildCard(cardData) {
       <div class="sub">السعر الحالي</div>
     </div>
     <div class="cell score-cell">
-      <div class="val" data-score>${c.score ?? 0}%</div>
-      <div class="sub">قوة الإشارة</div>
+      <div class="val" data-score>${lv.rr ?? "—"}</div>
+      <div class="sub">R:R</div>
     </div>
     <div class="cell badge-cell">
       <div class="badge" data-badge>🔥 ${c.label || "—"}</div>
-      <button class="card-trash">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <button class="card-trash" data-trash>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polyline points="3 6 5 6 21 6"></polyline>
           <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
         </svg>
@@ -303,14 +363,7 @@ function buildCard(cardData) {
   </div>`;
 
   const tfs = cardData.timeframes || [];
-  const tfsHtml = tfs.map((t, idx) => `
-    <div class="tf-cell ${t.trend}" data-tf-cell="${idx}">
-      <div class="tf-label"><span>${t.label}</span><span data-tf-trend>${trendLabel(t.trend)}</span></div>
-      <div class="tf-row"><span>EMA</span><span class="v" data-tf-ema>${t.ema20}/${t.ema50}</span></div>
-      <div class="tf-row"><span>RSI</span><span class="v" data-tf-rsi>${t.rsi}</span></div>
-      <div class="tf-row"><span>ADX</span><span class="v" data-tf-adx>${t.adx}</span></div>
-      <div class="tf-row"><span>RVOL</span><span class="v" data-tf-rvol>${t.rvol}x</span></div>
-    </div>`).join("");
+  const tfsHtml = tfs.map(t => buildTFBox(t)).join("");
 
   const oiHtml = `<div class="oi-grid">
     ${buildOIBlockStatic("مفتوحة - PUT", "put-oi", "#8b5cf6")}
@@ -346,12 +399,6 @@ function buildCard(cardData) {
     ${oiHtml}
     ${boxesHtml}
     ${whalesHtml}
-    <div class="bottom-grid">
-      <div class="cell"><div class="label">VWAP</div><div class="val" data-btm-vwap>$${cardData.vwap ?? "—"}</div></div>
-      <div class="cell"><div class="label">مقاومات</div><div class="val" data-btm-res>${(cardData.resistances||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">دعوم</div><div class="val" data-btm-sup>${(cardData.supports||[]).join(" / ") || "—"}</div></div>
-      <div class="cell"><div class="label">السعر</div><div class="val" data-btm-price>$${price.toFixed(2)}</div></div>
-    </div>
     <div data-summary-wrap>${buildSummaryBar(cardData)}</div>
   </div>`;
 
@@ -359,36 +406,45 @@ function buildCard(cardData) {
   updateAllDynamic(div, sym, cardData);
 
   div.addEventListener("click", (e) => {
-    if (e.target.closest(".card-trash")) return;
+    if (e.target.closest("[data-trash]")) return;
     div.classList.toggle("open");
   });
-  div.querySelector(".card-trash").addEventListener("click", (e) => {
+  div.querySelector("[data-trash]").addEventListener("click", (e) => {
     e.stopPropagation(); deleteCard(sym);
   });
 
+  if (!cardData.ai_analysis) enqueueAIRequest(sym);
   return div;
+}
+
+function updateAllDynamic(root, sym, card) {
+  if (!root || !card) return;
+  const callOI = card.call_oi || [];
+  const putOI  = card.put_oi  || [];
+  updateOIBlockData(root, "put-oi",   putOI);
+  updateOIBlockData(root, "put-liq",  putOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updateOIBlockData(root, "call-oi",  callOI);
+  updateOIBlockData(root, "call-liq", callOI.map(x => ({strike: x.strike, oi: x.volume})));
+  updatePutCallBoxes(root, sym, card);
+  updateWhalesData(root, sym, card.whales || []);
 }
 
 function updateCardInPlace(cardEl, data) {
   const c = data.card || {};
+  if (!VALID_COLORS.includes(c.color)) { cardEl.remove(); return; }
   const lv = data.levels || {};
-  const sym = data.symbol;
   const price = data.price ?? 0;
 
   const wasOpen = cardEl.classList.contains("open");
-  cardEl.className = "card " + (c.color || "gray");
-  if (wasOpen) cardEl.classList.add("open");
-
-  const badge = cardEl.querySelector("[data-badge]");
-  if (badge) badge.textContent = "🔥 " + (c.label || "—");
-
-  const score = cardEl.querySelector("[data-score]");
-  if (score) score.textContent = (c.score ?? 0) + "%";
+  const newCls = "card " + c.color + (wasOpen ? " open" : "");
+  if (cardEl.className !== newCls) cardEl.className = newCls;
 
   const priceEl = cardEl.querySelector("[data-price]");
   if (priceEl) priceEl.textContent = "$" + price.toFixed(2);
-  const btmPrice = cardEl.querySelector("[data-btm-price]");
-  if (btmPrice) btmPrice.textContent = "$" + price.toFixed(2);
+  const scoreEl = cardEl.querySelector("[data-score]");
+  if (scoreEl) scoreEl.textContent = lv.rr ?? "—";
+  const badgeEl = cardEl.querySelector("[data-badge]");
+  if (badgeEl) badgeEl.textContent = "🔥 " + (c.label || "—");
 
   const row2 = cardEl.querySelector(".row-2");
   if (row2) {
@@ -398,7 +454,6 @@ function updateCardInPlace(cardEl, data) {
     if (cells[2]) cells[2].textContent = lv.expiry || "—";
     if (cells[3]) cells[3].textContent = lv.strike || "—";
   }
-
   const row3 = cardEl.querySelector(".row-3");
   if (row3) {
     const cells = row3.querySelectorAll(".cell .val");
@@ -407,73 +462,33 @@ function updateCardInPlace(cardEl, data) {
     if (cells[2]) cells[2].textContent = lv.target1 ? "$" + lv.target1 : "—";
     if (cells[3]) cells[3].textContent = lv.entry ? "$" + lv.entry : "—";
   }
-
-  const tfs = data.timeframes || [];
-  tfs.forEach((t, idx) => {
-    const cell = cardEl.querySelector(`[data-tf-cell="${idx}"]`);
-    if (!cell) return;
-    cell.className = "tf-cell " + t.trend;
-    const trendEl = cell.querySelector("[data-tf-trend]");
-    if (trendEl) trendEl.textContent = trendLabel(t.trend);
-    const emaEl = cell.querySelector("[data-tf-ema]");
-    if (emaEl) emaEl.textContent = `${t.ema20}/${t.ema50}`;
-    const rsiEl = cell.querySelector("[data-tf-rsi]");
-    if (rsiEl) rsiEl.textContent = t.rsi;
-    const adxEl = cell.querySelector("[data-tf-adx]");
-    if (adxEl) adxEl.textContent = t.adx;
-    const rvolEl = cell.querySelector("[data-tf-rvol]");
-    if (rvolEl) rvolEl.textContent = t.rvol + "x";
-  });
-
-  const vwapEl = cardEl.querySelector("[data-btm-vwap]");
-  if (vwapEl) vwapEl.textContent = "$" + (data.vwap ?? "—");
-  const resEl = cardEl.querySelector("[data-btm-res]");
-  if (resEl) resEl.textContent = (data.resistances || []).join(" / ") || "—";
-  const supEl = cardEl.querySelector("[data-btm-sup]");
-  if (supEl) supEl.textContent = (data.supports || []).join(" / ") || "—";
-
-  updateAllDynamic(cardEl, sym, data);
-
+  const tfGrid = cardEl.querySelector(".tf-grid");
+  if (tfGrid) {
+    const tfs = data.timeframes || [];
+    tfGrid.innerHTML = tfs.map(t => buildTFBox(t)).join("");
+  }
+  updateAllDynamic(cardEl, data.symbol, data);
   const sumWrap = cardEl.querySelector("[data-summary-wrap]");
   if (sumWrap) sumWrap.innerHTML = buildSummaryBar(data);
-
-  checkSound(sym, c.color);
 }
 
 function rebuildCard(symbol, newData) {
   const idx = cards.findIndex(c => c.symbol === symbol);
   if (idx === -1) return;
-
-  const oldCard = cards[idx];
+  const old = cards[idx];
   const merged = { ...newData };
-
-  if (!newData.call_oi || newData.call_oi.length === 0) {
-    merged.call_oi = oldCard.call_oi || [];
-  }
-  if (!newData.put_oi || newData.put_oi.length === 0) {
-    merged.put_oi = oldCard.put_oi || [];
-  }
-  if (!newData.whales || newData.whales.length === 0) {
-    merged.whales = oldCard.whales || [];
-  }
-
-  if ((newData.total_call_oi || 0) === 0 && (oldCard.total_call_oi || 0) > 0) {
-    merged.total_call_oi = oldCard.total_call_oi;
-  }
-  if ((newData.total_put_oi || 0) === 0 && (oldCard.total_put_oi || 0) > 0) {
-    merged.total_put_oi = oldCard.total_put_oi;
-  }
-  if ((newData.total_call_vol || 0) === 0 && (oldCard.total_call_vol || 0) > 0) {
-    merged.total_call_vol = oldCard.total_call_vol;
-  }
-  if ((newData.total_put_vol || 0) === 0 && (oldCard.total_put_vol || 0) > 0) {
-    merged.total_put_vol = oldCard.total_put_vol;
-  }
-
+  if (!newData.call_oi || newData.call_oi.length === 0) merged.call_oi = old.call_oi || [];
+  if (!newData.put_oi  || newData.put_oi.length === 0)  merged.put_oi  = old.put_oi  || [];
+  if (!newData.whales  || newData.whales.length === 0)  merged.whales  = old.whales  || [];
+  if (!newData.ai_analysis && old.ai_analysis)          merged.ai_analysis = old.ai_analysis;
   cards[idx] = merged;
-  const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-  if (!cardEl) return;
-  updateCardInPlace(cardEl, merged);
+  const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+  if (!el) return;
+  if (!VALID_COLORS.includes((newData.card||{}).color)) {
+    el.remove();
+  } else {
+    updateCardInPlace(el, merged);
+  }
   saveCards();
 }
 
@@ -481,13 +496,15 @@ function renderCards() {
   cardsArea.innerHTML = "";
   emptyState.style.display = cards.length ? "none" : "block";
   const sorted = [...cards].sort((a, b) => {
-    const sa = a.card?.score ?? 0, sb = b.card?.score ?? 0;
     const ga = a.card?.color === "gray" ? -1 : 0;
     const gb = b.card?.color === "gray" ? -1 : 0;
     if (ga !== gb) return gb - ga;
-    return sb - sa;
+    return (b.levels?.rr ?? 0) - (a.levels?.rr ?? 0);
   });
-  sorted.forEach(c => cardsArea.appendChild(buildCard(c)));
+  sorted.forEach(c => {
+    const el = buildCard(c);
+    if (el) cardsArea.appendChild(el);
+  });
 }
 
 async function searchSymbol(symbol) {
@@ -532,12 +549,10 @@ function updateCardPrice(symbol, price) {
   if (!card) return;
   if (price && price > 0 && price !== card.price) {
     card.price = price;
-    const cardEl = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
-    if (!cardEl) return;
-    const priceEl = cardEl.querySelector("[data-price]");
-    if (priceEl) priceEl.textContent = "$" + parseFloat(price).toFixed(2);
-    const btmPrice = cardEl.querySelector("[data-btm-price]");
-    if (btmPrice) btmPrice.textContent = "$" + parseFloat(price).toFixed(2);
+    const el = cardsArea.querySelector(`[data-symbol="${symbol}"]`);
+    if (!el) return;
+    const p = el.querySelector("[data-price]");
+    if (p) p.textContent = "$" + parseFloat(price).toFixed(2);
   }
 }
 
@@ -604,18 +619,14 @@ searchForm.addEventListener("submit", (e) => {
 (function init() {
   cards = loadCards();
   renderCards();
-
   cards.forEach(c => {
     connectLive(c.symbol);
     startStatePolling(c.symbol);
+    if (!c.ai_analysis) enqueueAIRequest(c.symbol);
   });
-
-  setTimeout(() => {
-    cards.forEach(c => fetchState(c.symbol));
-  }, 2000);
-
+  setTimeout(() => cards.forEach(c => fetchState(c.symbol)), 2000);
   checkBackendStatus();
   setInterval(checkBackendStatus, 60000);
   setTimeout(pollPrices, 3000);
-  pollTimer = setInterval(pollPrices, 5000);
+  setInterval(pollPrices, 5000);
 })();
