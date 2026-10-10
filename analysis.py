@@ -1,12 +1,8 @@
 """
 analysis.py — Cascade Break & Retest
 مساران: اختراق يومي/أسبوعي، أو اختراق 4H/يومي.
-حالات: green (CALL) / red (PUT) / yellow (انتظار) / gray (لا إشارة)
-
-⚠️ عقد البيانات:
-- المستدعي (market_time.py) ينشئ time وclose_time وفق تقويم جلسات NYSE.
-- المنطق يستخدم close_time حصراً.
-- المستدعي يمرر الشموع المكتملة فقط.
+حالات: green / red / yellow / gray
+مع مربعات الاستراتيجية (strategy_boxes)
 """
 from __future__ import annotations
 
@@ -373,7 +369,7 @@ def detect_pattern(df, idx, direction):
 
 
 def _build_result(direction, stage, entry, target1, target2, stop,
-                  level, retest_info, break_info, sr_dict, tfs, pattern=""):
+                  level, retest_info, break_info, sr_dict, tfs, strategy_boxes, pattern=""):
     if any(v is None or not np.isfinite(float(v)) for v in (entry, target1, stop)):
         return None
     entry, target1, stop = float(entry), float(target1), float(stop)
@@ -403,35 +399,87 @@ def _build_result(direction, stage, entry, target1, target2, stop,
             "direction": "call" if direction == "up" else "put",
             "breakout_stage": stage, "levels": levels,
             "break_info": break_info, "retest_info": retest_info,
-            "support_resistance": sr_dict, "timeframes": tfs}
+            "support_resistance": sr_dict, "timeframes": tfs,
+            "strategy_boxes": strategy_boxes}
 
 
-def _tf_snapshot(df, label):
-    if not _valid_df(df) or len(df) < 5:
-        return {"label": label, "support": None, "resistance": None,
-                "broke_resistance": False, "broke_support": False}
-    data = _sorted_df(df)
-    res, sup = prev_candle_hl(data, -2)
-    price = float(data.iloc[-1]["close"])
-    return {"label": label,
-            "support": round(sup, 2) if sup is not None else None,
-            "resistance": round(res, 2) if res is not None else None,
-            "broke_resistance": res is not None and price > res,
-            "broke_support": sup is not None and price < sup}
-
-
-def _empty_result(sr_dict=None, tfs=None):
+def _empty_result(sr_dict=None, tfs=None, strategy_boxes=None):
     return {"color": "gray", "label": "لا إشارة", "status": "none",
             "direction": None, "breakout_stage": None, "levels": {},
-            "timeframes": tfs or [], "support_resistance": sr_dict or {}}
+            "timeframes": tfs or [], "support_resistance": sr_dict or {},
+            "strategy_boxes": strategy_boxes or []}
 
 
-def _waiting_result(label, direction, stage, level, sr_dict, tfs):
+def _waiting_result(label, direction, stage, level, sr_dict, tfs, strategy_boxes):
     return {"color": "yellow", "label": label, "status": "waiting",
             "direction": "call" if direction == "up" else "put",
             "breakout_stage": stage,
             "levels": {"level_broken": round(float(level), 2)},
-            "timeframes": tfs, "support_resistance": sr_dict}
+            "timeframes": tfs, "support_resistance": sr_dict,
+            "strategy_boxes": strategy_boxes}
+
+
+def _build_strategy_boxes(w_high, w_low, d_high, d_low, d_last_close, tracker):
+    boxes = []
+    boxes.append({
+        "label": "1W", "kind": "reference", "title": "قمة الأسبوع",
+        "value": round(w_high, 2) if w_high is not None else None,
+        "sub": f"دعم {round(w_low, 2)}" if w_low is not None else "",
+        "state": "reference",
+    })
+
+    if d_last_close is None or w_high is None:
+        boxes.append({"label": "1D", "kind": "breakout", "state": "waiting",
+                      "text": "— بيانات غير كافية"})
+    elif tracker.get("daily_break") == "up":
+        boxes.append({"label": "1D", "kind": "breakout", "state": "broke_up",
+                      "text": f"✅ اخترق مقاومة الأسبوع (${round(w_high, 2)})"})
+    elif tracker.get("daily_break") == "down":
+        boxes.append({"label": "1D", "kind": "breakout", "state": "broke_down",
+                      "text": f"✅ كسر دعم الأسبوع (${round(w_low, 2)})"})
+    else:
+        boxes.append({"label": "1D", "kind": "breakout", "state": "waiting",
+                      "text": "⏳ لم يخترق ولم يكسر الأسبوع"})
+
+    rs = tracker.get("retest_status", "inactive")
+    direction = tracker.get("direction")
+    lvl = tracker.get("retest_level")
+    lvl_txt = f" (${round(lvl, 2)})" if lvl is not None else ""
+
+    if rs == "waiting_retest":
+        txt = f"⏳ ينتظر إعادة اختبار المستوى المخترق{lvl_txt}" if direction == "up" else f"⏳ ينتظر إعادة اختبار المستوى المكسور{lvl_txt}"
+        boxes.append({"label": "4H", "kind": "retest", "state": "waiting_retest", "text": txt})
+    elif rs == "retested":
+        txt = f"✅ أعاد اختبار المستوى المخترق — ينتظر التأكيد{lvl_txt}" if direction == "up" else f"✅ أعاد اختبار المستوى المكسور — ينتظر التأكيد{lvl_txt}"
+        boxes.append({"label": "4H", "kind": "retest", "state": "retested", "text": txt})
+    elif rs == "confirmed":
+        txt = f"✅ تأكيد الدخول (CALL){lvl_txt}" if direction == "up" else f"✅ تأكيد الدخول (PUT){lvl_txt}"
+        boxes.append({"label": "4H", "kind": "retest", "state": "confirmed", "text": txt})
+    elif rs == "invalidated":
+        boxes.append({"label": "4H", "kind": "retest", "state": "invalidated",
+                      "text": f"❌ إلغاء — الإغلاق ضد المستوى{lvl_txt}"})
+    elif rs == "path2_waiting":
+        txt = f"⏳ اخترق مقاومة أمس — ينتظر تأكيد 1H{lvl_txt}" if direction == "up" else f"⏳ كسر دعم أمس — ينتظر تأكيد 1H{lvl_txt}"
+        boxes.append({"label": "4H", "kind": "retest", "state": "path2_waiting", "text": txt})
+    elif rs == "path2_confirmed":
+        boxes.append({"label": "4H", "kind": "retest", "state": "confirmed",
+                      "text": f"✅ اختراق/كسر أمس + تأكيد 1H{lvl_txt}"})
+    else:
+        boxes.append({"label": "4H", "kind": "retest", "state": "inactive",
+                      "text": "— لم يُفعَّل بعد"})
+
+    cs = tracker.get("confirm_1h_status", "inactive")
+    if cs == "waiting":
+        boxes.append({"label": "1H", "kind": "confirmation", "state": "waiting",
+                      "text": "⏳ ينتظر تأكيد الدخول"})
+    elif cs == "confirmed":
+        boxes.append({"label": "1H", "kind": "confirmation", "state": "confirmed",
+                      "text": "✅ تأكيد الدخول"})
+    else:
+        boxes.append({"label": "1H", "kind": "confirmation", "state": "inactive",
+                      "text": "— لم يُفعَّل بعد"})
+
+    return boxes
 
 
 def scan_setup(df_weekly, df_daily, df_4h, df_1h):
@@ -449,31 +497,35 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
                           "resistance": round(display_w_high, 2) if display_w_high is not None else None},
                "daily": {"support": round(display_d_low, 2) if display_d_low is not None else None,
                          "resistance": round(display_d_high, 2) if display_d_high is not None else None}}
-    tfs = [_tf_snapshot(df_weekly, "1W"), _tf_snapshot(df_daily, "1D"),
-           _tf_snapshot(df_4h, "4H"), _tf_snapshot(df_1h, "1H")]
+    tfs = []
 
     atr4s, atr1s = atr(df_4h), atr(df_1h)
     if len(atr4s) == 0 or len(atr1s) == 0:
         return _empty_result(sr_dict, tfs)
 
-    # Track best partial state
-    # priority: 2 = retest done, 1 = breakout only
-    partial = None
+    tracker = {"daily_break": None, "retest_status": "inactive",
+               "retest_level": None, "direction": None,
+               "confirm_1h_status": "inactive"}
+    d_last_close = float(df_daily.iloc[-1]["close"])
 
-    # ── المسار الأول: اليومي اخترق الأسبوع
+    # ── المسار الأول
     for direction in ("up", "down"):
         brk = check_breakout_dynamic(df_daily, df_weekly, direction)
         if not brk.get("broken"):
             continue
         level = float(brk["level"])
-        if partial is None:
-            partial = {"label": "اختراق، بانتظار Retest", "direction": direction,
-                       "stage": "daily_break_weekly", "level": level, "priority": 1}
+        tracker["daily_break"] = direction
+        tracker["direction"] = direction
+        tracker["retest_level"] = level
+        tracker["retest_status"] = "waiting_retest"
+
         retest = find_retest(df_4h, level, direction, brk["break_time"])
         if not retest.get("retested"):
+            if retest.get("status") == "invalidated_before_retest":
+                tracker["retest_status"] = "invalidated"
             continue
-        partial = {"label": "Retest، بانتظار التأكيد", "direction": direction,
-                   "stage": "daily_break_weekly", "level": level, "priority": 2}
+        tracker["retest_status"] = "retested"
+
         second = find_second_candle(df_4h, level, direction, retest["retest_idx"])
         if not second.get("found"):
             continue
@@ -485,6 +537,9 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         stab = check_stability(df_4h, level, direction, retest["retest_idx"], second["second_idx"])
         if not stab["stable"]:
             continue
+
+        tracker["retest_status"] = "confirmed"
+
         entry = second["entry"]
         entry_time = pd.to_datetime(second["entry_time"], utc=True)
         daily_break_row = df_daily.iloc[int(brk["break_index"])]
@@ -498,13 +553,16 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
             continue
         stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_4h if direction == "up"
                 else retest["retest_high"] + ATR_MULTIPLIER * atr_4h)
+        strategy_boxes = _build_strategy_boxes(display_w_high, display_w_low,
+                                                display_d_high, display_d_low,
+                                                d_last_close, tracker)
         result = _build_result(direction, "daily_break_weekly", entry, target1, None,
-                               stop, level, retest, brk, sr_dict, tfs,
+                               stop, level, retest, brk, sr_dict, tfs, strategy_boxes,
                                detect_pattern(df_4h, second["second_idx"], direction))
         if result:
             return result
 
-    # ── المسار الثاني: 4H اخترق اليوم
+    # ── المسار الثاني
     last_daily_row = df_daily.iloc[-1]
     pw_h, pw_l = _reference_levels_before(df_weekly, last_daily_row["close_time"])
     p2_dirs = []
@@ -517,14 +575,17 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         if not brk.get("broken"):
             continue
         level = float(brk["level"])
-        if partial is None or partial.get("priority", 0) < 1:
-            partial = {"label": "اختراق، بانتظار Retest", "direction": direction,
-                       "stage": "4h_break_daily", "level": level, "priority": 1}
+        tracker["direction"] = direction
+        tracker["retest_level"] = level
+        tracker["retest_status"] = "path2_waiting"
+
         retest = find_retest(df_4h, level, direction, brk["break_time"])
         if not retest.get("retested"):
+            if retest.get("status") == "invalidated_before_retest":
+                tracker["retest_status"] = "invalidated"
             continue
-        partial = {"label": "Retest، بانتظار التأكيد", "direction": direction,
-                   "stage": "4h_break_daily", "level": level, "priority": 2}
+        tracker["confirm_1h_status"] = "waiting"
+
         confirm = find_confirmation_1h(df_1h, retest, direction)
         if not confirm.get("confirmed"):
             continue
@@ -541,6 +602,10 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         stab = check_stability(df_4h, level, direction, retest["retest_idx"], stability_end)
         if not stab["stable"]:
             continue
+
+        tracker["retest_status"] = "path2_confirmed"
+        tracker["confirm_1h_status"] = "confirmed"
+
         entry = confirm["entry"]
         confirm_ts = pd.to_datetime(confirm_time, utc=True)
         start_ts = pd.to_datetime(brk["break_time"], utc=True)
@@ -553,17 +618,36 @@ def scan_setup(df_weekly, df_daily, df_4h, df_1h):
         target2 = t2h if direction == "up" else t2l
         stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_1h if direction == "up"
                 else retest["retest_high"] + ATR_MULTIPLIER * atr_1h)
+        strategy_boxes = _build_strategy_boxes(display_w_high, display_w_low,
+                                                display_d_high, display_d_low,
+                                                d_last_close, tracker)
         result = _build_result(direction, "4h_break_daily", entry, target1, target2,
-                               stop, level, retest, brk, sr_dict, tfs,
+                               stop, level, retest, brk, sr_dict, tfs, strategy_boxes,
                                detect_pattern(df_1h, confirm["confirm_idx"], direction))
         if result:
             return result
 
-    # No complete signal
-    if partial is not None:
-        return _waiting_result(partial["label"], partial["direction"],
-                               partial["stage"], partial["level"], sr_dict, tfs)
-    return _empty_result(sr_dict, tfs)
+    # ── لا إشارة
+    strategy_boxes = _build_strategy_boxes(display_w_high, display_w_low,
+                                            display_d_high, display_d_low,
+                                            d_last_close, tracker)
+
+    if tracker["retest_status"] == "waiting_retest":
+        return _waiting_result("اختراق، بانتظار إعادة الاختبار",
+                               tracker["direction"], "daily_break_weekly",
+                               tracker["retest_level"], sr_dict, tfs, strategy_boxes)
+
+    if tracker["retest_status"] == "retested":
+        return _waiting_result("إعادة اختبار، بانتظار التأكيد",
+                               tracker["direction"], "daily_break_weekly",
+                               tracker["retest_level"], sr_dict, tfs, strategy_boxes)
+
+    if tracker["retest_status"] == "path2_waiting":
+        return _waiting_result("4H اخترق/كسر اليوم، بانتظار تأكيد 1H",
+                               tracker["direction"], "4h_break_daily",
+                               tracker["retest_level"], sr_dict, tfs, strategy_boxes)
+
+    return _empty_result(sr_dict, tfs, strategy_boxes)
 
 
 def last_price(df):
