@@ -102,16 +102,28 @@ def _build_ai_prompt(data):
         elif t.get("broke_support"):  st = "مكسور هبوطاً"
         else: st = "محايد"
         tf_lines.append(f"- {t.get('label')}: مقاومة {t.get('resistance')} / دعم {t.get('support')} / {st}")
-    dir_txt = "CALL (صاعد)" if card.get("color") == "green" else "PUT (هابط)"
+
+    color = card.get("color", "gray")
+    if color == "green":
+        dir_txt = "CALL (صاعد) — إشارة مؤكدة"
+    elif color == "red":
+        dir_txt = "PUT (هابط) — إشارة مؤكدة"
+    elif color == "yellow":
+        dir_txt = f"انتظار — {card.get('label', 'قيد المراقبة')}"
+    else:
+        dir_txt = "لا إشارة حالياً"
+
     stage_txt = {"daily_break_weekly": "إغلاق يومي خارج قمة/قاع الأسبوع السابق",
                  "4h_break_daily": "إغلاق 4H خارج قمة/قاع اليوم السابق"}.get(card.get("stage"), "—")
-    return f"""أنت محلل فني محترف. حلّل هذه الإشارة في 3-4 أسطر عربية فقط.
-ركّز على: قوة الزخم، جودة الاختراق، الثبات، السياق، والمخاطرة.
+
+    return f"""أنت محلل فني محترف. حلّل الوضع الحالي لهذا السهم في 3-4 أسطر عربية فقط.
+ركّز على: قوة الزخم، جودة الاختراق (إن وُجد)، الثبات، السياق، والمخاطرة.
+إذا كانت الحالة "انتظار" أو "لا إشارة" — اشرح ما ينتظره السوق ومتى يُفعَّل.
 لا Markdown ولا رموز ولا عناوين.
 
 البيانات:
 - الرمز: {sym}
-- الاتجاه: {dir_txt}
+- الحالة: {dir_txt}
 - المرحلة: {stage_txt}
 - مستوى الاختراق: {lv.get('level_broken')}
 - الدخول: {lv.get('entry')} | الوقف: {lv.get('stop')} | الهدف: {lv.get('target1')}
@@ -436,7 +448,7 @@ def analyze_symbol(symbol):
 
     levels = scan.get("levels", {}) or {}
 
-    # ✅ جلب العقود دائماً — حتى للرمادي والأصفر (السلوك الأصلي)
+    # ✅ جلب العقود دائماً — حتى للرمادي والأصفر
     direction = scan["direction"] or "bullish"
     opt = fetch_option_data(symbol, direction, price, "swing")
 
@@ -624,8 +636,7 @@ async def ai_analysis(symbol):
         data = await asyncio.to_thread(analyze_cached, sym)
     except Exception as e:
         return {"ok": False, "reason": f"analyze_error: {e}"}
-    if data.get("card", {}).get("color") not in VALID_COLORS:
-        return {"ok": False, "reason": "no_signal"}
+    # ✅ نسمح للأصفر والرمادي أيضاً (لا شرط على اللون)
     try:
         text = await asyncio.to_thread(get_ai_analysis, data)
     except Exception as e:
