@@ -1,572 +1,656 @@
 """
-analysis.py — Longbridge Options Radar
-الاستراتيجية: Sweep + Virgin FVG + تأكيد 1H
-Multi-Timeframe: 1W → 1D → 4H → 1H
+analysis.py — استراتيجية الاختراق وإعادة الاختبار
+مساران: اختراق يومي/أسبوعي، أو اختراق 4H/يومي.
+
+⚠️ عقد البيانات:
+- المستدعي (market_time.py) ينشئ time وclose_time وفق تقويم جلسات NYSE الفعلي.
+- المنطق يستخدم close_time حصراً؛ ولا يُفترض أن إغلاق اليومي = timestamp + 24h
+  أو إغلاق الأسبوعي = timestamp + 7 أيام.
+- المستدعي يمرر الشموع المكتملة فقط، بما في ذلك الشموع الأسبوعية التي تكتمل بعد إغلاق الجمعة.
+
+⚠️ تحديد المستويات (إصلاح جوهري):
+- "قمة/قاع الأسبوع السابق": تُحدد زمنياً — آخر شمعة أسبوعية مُكتملة
+  في الأسبوع التقويمي السابق (بتوقيت نيويورك).
+- "قمة/قاع أمس": تُحدد زمنياً — آخر شمعة يومية مُكتملة قبل بداية
+  اليوم الحالي (بتوقيت نيويورك).
+- لا يعتمد على الموضع (-1/-2) لأن ذلك يُنتج قمة/قاع خاطئة حسب يوم الأسبوع.
 """
+from __future__ import annotations
+
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 
+MIN_RVOL = 1.5
+MIN_RR = 2.0
+MAX_RETEST_CANDLES = 5
+MAX_FIRST_CANDLE_WINDOW = 5
+MAX_SECOND_CANDLE_WINDOW = 5
+MAX_1H_CONFIRM_CANDLES = 5
+BODY_RATIO_MIN = 0.6
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 0.5
+TOLERANCE_PCT = 0.003
+TOLERANCE_ATR_MULT = 0.25
+BREAKOUT_LOOKBACK = 10
+RVOL_PERIOD = 20
+
+MARKET_TZ = "America/New_York"
+
+_REQUIRED_COLUMNS = {"open", "high", "low", "close", "volume"}
+_TIME_COLUMNS = {"time", "close_time"}
+
 
 # ============================================================
-# المؤشرات الأساسية
+# تجهيز البيانات والتحقق منها
 # ============================================================
-def ema(s, n):
-    return s.ewm(span=n, adjust=False).mean()
+def _valid_df(df: Optional[pd.DataFrame]) -> bool:
+    """يتطلب أعمدة OHLCV + time + close_time."""
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    if not _REQUIRED_COLUMNS.issubset(df.columns):
+        return False
+    if not _TIME_COLUMNS.issubset(df.columns):
+        return False
+    return True
 
 
-def rsi(s, n=14):
-    d = s.diff()
-    g = d.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
-    l = (-d.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
-    rs = g / l.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
+def _sorted_df(df: pd.DataFrame) -> pd.DataFrame:
+    """تنظيف OHLCV وترتيبه زمنياً بفهرس رقمي متسلسل."""
+    out = df.copy()
+    out["time"] = pd.to_datetime(out["time"], errors="coerce", utc=True)
+    out["close_time"] = pd.to_datetime(out["close_time"], errors="coerce", utc=True)
+    for col in ("open", "high", "low", "close", "volume"):
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["time", "close_time", "open", "high", "low", "close", "volume"])
+    out = out[(out[["open", "high", "low", "close"]] > 0).all(axis=1) & (out["volume"] >= 0)]
+    out = out[(out["high"] >= out[["open", "close", "low"]].max(axis=1)) &
+              (out["low"] <= out[["open", "close", "high"]].min(axis=1))]
+    out = out.sort_values("close_time", kind="stable")
+    out = out.drop_duplicates(subset=["close_time"], keep="last")
+    return out.reset_index(drop=True)
 
 
-def atr(df, n=14):
-    h, l, c = df["high"], df["low"], df["close"]
+def _time_of(df: Optional[pd.DataFrame], pos: int):
+    """وقت الإغلاق للصف pos (المرجع الزمني في كل المنطق)."""
+    if df is None or "close_time" not in df.columns or pos < 0 or pos >= len(df):
+        return None
+    return df.iloc[pos]["close_time"]
+
+
+def _positions_after(df: pd.DataFrame, timestamp, strict: bool = True) -> list[int]:
+    """مواقع الصفوف بعد timestamp (وفق close_time)."""
+    if "close_time" not in df.columns or timestamp is None:
+        return []
+    ts = pd.to_datetime(timestamp, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return []
+    mask = df["close_time"] > ts if strict else df["close_time"] >= ts
+    return np.flatnonzero(mask.to_numpy()).tolist()
+
+
+# ============================================================
+# المؤشرات
+# ============================================================
+def atr(df: pd.DataFrame, n: int = ATR_PERIOD) -> pd.Series:
+    if not _valid_df(df):
+        return pd.Series(dtype=float)
+    h, l, c = df["high"].astype(float), df["low"].astype(float), df["close"].astype(float)
     pc = c.shift(1)
     tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/n, adjust=False).mean()
+    return tr.ewm(alpha=1 / n, adjust=False, min_periods=n).mean()
 
 
-def adx(df, n=14):
-    h, l = df["high"], df["low"]
-    up, dn = h.diff(), -l.diff()
-    pdm = np.where((up > dn) & (up > 0), up, 0.0)
-    ndm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    a = atr(df, n)
-    pdi = 100 * pd.Series(pdm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / a
-    ndi = 100 * pd.Series(ndm, index=df.index).ewm(alpha=1/n, adjust=False).mean() / a
-    dx = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
-    return dx.ewm(alpha=1/n, adjust=False).mean()
-
-
-def vwap(df):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    return (tp * df["volume"]).cumsum() / df["volume"].cumsum().replace(0, np.nan)
-
-
-def rvol(df, n=20):
-    """حجم الشمعة المكتملة الأخيرة ÷ متوسط n شمعة سابقة"""
-    if len(df) < n + 1:
-        return 1.0
-    avg = df["volume"].iloc[-n-1:-1].mean()
-    return float(df["volume"].iloc[-1] / avg) if avg > 0 else 1.0
-
-
-def macd(s, fast=12, slow=26, signal=9):
-    ema_fast = s.ewm(span=fast, adjust=False).mean()
-    ema_slow = s.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+def rvol_series(df: pd.DataFrame, n: int = RVOL_PERIOD) -> pd.Series:
+    if not _valid_df(df):
+        return pd.Series(dtype=float)
+    avg = df["volume"].astype(float).shift(1).rolling(n, min_periods=n).mean()
+    return df["volume"].astype(float) / avg.replace(0, np.nan)
 
 
 # ============================================================
-# Swing Highs / Lows (2 قبل + 2 بعد)
+# أدوات عامة
 # ============================================================
-def swing_highs(df, k=2):
-    h = df["high"].values
-    result = []
-    for i in range(k, len(h) - k):
-        if all(h[i] > h[i-j] for j in range(1, k+1)) and \
-           all(h[i] > h[i+j] for j in range(1, k+1)):
-            result.append(i)
-    return result
+def prev_candle_hl(df: pd.DataFrame, idx: int = -2):
+    """high/low شمعة بموضع idx (يُستخدم لعرض الفريمات فقط)."""
+    if not _valid_df(df) or len(df) < abs(idx):
+        return None, None
+    row = df.iloc[idx]
+    return float(row["high"]), float(row["low"])
 
 
-def swing_lows(df, k=2):
-    l = df["low"].values
-    result = []
-    for i in range(k, len(l) - k):
-        if all(l[i] < l[i-j] for j in range(1, k+1)) and \
-           all(l[i] < l[i+j] for j in range(1, k+1)):
-            result.append(i)
-    return result
+def _body_ratio(row) -> float:
+    rng = max(float(row["high"]) - float(row["low"]), 1e-8)
+    return abs(float(row["close"]) - float(row["open"])) / rng
+
+
+def _is_bullish(row) -> bool:
+    return float(row["close"]) > float(row["open"])
+
+
+def _is_bearish(row) -> bool:
+    return float(row["close"]) < float(row["open"])
+
+
+def compute_tolerance(level: float, atr_val: float) -> float:
+    if not np.isfinite(level) or not np.isfinite(atr_val) or atr_val <= 0:
+        return 0.0
+    return min(abs(level) * TOLERANCE_PCT, atr_val * TOLERANCE_ATR_MULT)
 
 
 # ============================================================
-# تحديد الاتجاه (Trend)
+# تحديد المستويات زمنياً
 # ============================================================
-def trend_status(df, use_ema200=False):
+def _now_market() -> pd.Timestamp:
+    """الوقت الحالي بتوقيت نيويورك (سوق الأسهم الأمريكي)."""
+    return pd.Timestamp.now(tz=MARKET_TZ)
+
+
+def _completed_rows_as_of(df: pd.DataFrame, now_ny: Optional[pd.Timestamp]) -> pd.DataFrame:
+    """يرجع الشموع المكتملة حتى اللحظة المرجعية، مرتبة حسب close_time."""
+    if df is None or df.empty or "close_time" not in df.columns:
+        return pd.DataFrame()
+    data = _sorted_df(df)
+    now = _now_market() if now_ny is None else pd.Timestamp(now_ny)
+    if now.tzinfo is None:
+        now = now.tz_localize(MARKET_TZ)
+    now_utc = now.tz_convert("UTC")
+    return data[data["close_time"] <= now_utc]
+
+
+def get_prev_week_levels(df_weekly: pd.DataFrame,
+                         now_ny: Optional[pd.Timestamp] = None):
+    """قمة/قاع آخر أسبوع مكتمل؛ في السبت/الأحد يشمل أسبوع التداول المنتهي للتو."""
+    sub = _completed_rows_as_of(df_weekly, now_ny)
+    if sub.empty:
+        return None, None
+    row = sub.iloc[-1]
+    return float(row["high"]), float(row["low"])
+
+
+def get_prev_day_levels(df_daily: pd.DataFrame,
+                        now_ny: Optional[pd.Timestamp] = None):
+    """قمة/قاع آخر جلسة مكتملة قبل بداية اليوم الحالي بتوقيت نيويورك.
+
+    لا تتحول مستويات «أمس» إلى مستويات اليوم بعد إغلاق السوق؛ لذلك نستخدم
+    منتصف الليل المحلي حدّاً زمنياً ونستبعد أي شمعة أغلقت في اليوم الحالي.
+    في عطلة نهاية الأسبوع تبقى آخر جلسة فعلية (عادةً الجمعة) هي المرجع.
     """
-    up:     Close > EMA50 + بنية صاعدة (قمة أعلى + قاع أعلى)
-    down:   Close < EMA50 + بنية هابطة
-    neutral: غير ذلك
-    """
-    if len(df) < 60:
-        return {"status": "neutral", "reason": "بيانات غير كافية"}
+    sub = _completed_rows_as_of(df_daily, now_ny)
+    if sub.empty:
+        return None, None
+    now = _now_market() if now_ny is None else pd.Timestamp(now_ny)
+    if now.tzinfo is None:
+        now = now.tz_localize(MARKET_TZ)
+    day_start_utc = now.normalize().tz_convert("UTC")
+    sub = sub[sub["close_time"] < day_start_utc]
+    if sub.empty:
+        return None, None
+    row = sub.iloc[-1]
+    return float(row["high"]), float(row["low"])
 
-    close = df["close"]
-    e50 = ema(close, 50)
-    last_close = float(close.iloc[-1])
-    last_ema50 = float(e50.iloc[-1])
 
-    # بنية السعر
-    sh_idx = swing_highs(df, 2)
-    sl_idx = swing_lows(df, 2)
+def _reference_levels_before(reference_df: pd.DataFrame, timestamp):
+    """قمة/قاع آخر شمعة مرجعية أُغلقت قبل timestamp حصراً."""
+    if not _valid_df(reference_df) or timestamp is None:
+        return None, None
+    ts = pd.to_datetime(timestamp, errors="coerce", utc=True)
+    if pd.isna(ts):
+        return None, None
+    ref = _sorted_df(reference_df)
+    prior = ref[ref["close_time"] < ts]
+    if prior.empty:
+        return None, None
+    row = prior.iloc[-1]
+    return float(row["high"]), float(row["low"])
 
-    higher_highs = False
-    higher_lows = False
-    lower_highs = False
-    lower_lows = False
 
-    if len(sh_idx) >= 2:
-        if df["high"].iloc[sh_idx[-1]] > df["high"].iloc[sh_idx[-2]]:
-            higher_highs = True
-        else:
-            lower_highs = True
+# ============================================================
+# 1. فحص الاختراق الديناميكي
+# ============================================================
+def check_breakout_dynamic(df, reference_df, direction,
+                           lookback=BREAKOUT_LOOKBACK):
+    """يفحص الاختراق بمستوى الفترة السابقة لكل شمعة حسب توقيتها."""
+    if not _valid_df(df) or not _valid_df(reference_df):
+        return {"broken": False, "reason": "no_data"}
+    data = _sorted_df(df)
+    refs = _sorted_df(reference_df)
+    if len(data) < RVOL_PERIOD + 2:
+        return {"broken": False, "reason": "insufficient_data"}
+    rv_series = rvol_series(data, RVOL_PERIOD)
+    start = max(1, len(data) - max(1, int(lookback)))
+    crossing = None
+    for i in range(len(data) - 1, start - 1, -1):
+        level_high, level_low = _reference_levels_before(refs, data.iloc[i]["close_time"])
+        level = level_high if direction == "up" else level_low
+        if level is None:
+            continue
+        prev_close = float(data.iloc[i - 1]["close"])
+        close = float(data.iloc[i]["close"])
+        crossed = (prev_close <= level and close > level) if direction == "up" else (prev_close >= level and close < level)
+        if crossed:
+            crossing = (i, float(level))
+            break
+    if crossing is None:
+        return {"broken": False, "reason": "no_fresh_crossing"}
+    crossing_idx, level = crossing
+    row = data.iloc[crossing_idx]
+    rv = rv_series.iloc[crossing_idx]
+    body = _body_ratio(row)
+    if pd.isna(rv) or float(rv) < MIN_RVOL:
+        return {"broken": False, "reason": "latest_crossing_rvol_below_min",
+                "break_index": crossing_idx, "level": level,
+                "rvol": None if pd.isna(rv) else float(rv)}
+    if body < BODY_RATIO_MIN:
+        return {"broken": False, "reason": "breakout_body_below_min",
+                "break_index": crossing_idx, "level": level,
+                "body_ratio": round(body, 3)}
+    if direction == "up" and not _is_bullish(row):
+        return {"broken": False, "reason": "breakout_candle_not_bullish",
+                "break_index": crossing_idx, "level": level}
+    if direction == "down" and not _is_bearish(row):
+        return {"broken": False, "reason": "breakout_candle_not_bearish",
+                "break_index": crossing_idx, "level": level}
+    return {"broken": True, "type": direction, "level": level,
+            "break_index": crossing_idx, "break_time": _time_of(data, crossing_idx),
+            "break_close": float(row["close"]), "rvol": round(float(rv), 2),
+            "body_ratio": round(body, 2)}
 
-    if len(sl_idx) >= 2:
-        if df["low"].iloc[sl_idx[-1]] > df["low"].iloc[sl_idx[-2]]:
-            higher_lows = True
-        else:
-            lower_lows = True
 
-    above_ema = last_close > last_ema50
+# ============================================================
+# 2. فحص Retest
+# ============================================================
+def find_retest(df, level, direction, break_time=None, atr_val=None,
+                max_candles=MAX_RETEST_CANDLES):
+    if not _valid_df(df) or len(df) < 5 or level is None:
+        return {"retested": False, "status": "no_data"}
 
-    # شروط إضافية (اختياري)
-    ema200_ok_up = True
-    ema200_ok_down = True
-    if use_ema200 and len(df) >= 200:
-        e200 = ema(close, 200)
-        ema200_ok_up = last_ema50 > float(e200.iloc[-1])
-        ema200_ok_down = last_ema50 < float(e200.iloc[-1])
-
-    if above_ema and (higher_highs or higher_lows) and ema200_ok_up:
-        return {"status": "up", "reason": "Close > EMA50 + بنية صاعدة"}
-    elif not above_ema and (lower_highs or lower_lows) and ema200_ok_down:
-        return {"status": "down", "reason": "Close < EMA50 + بنية هابطة"}
+    data = _sorted_df(df)
+    atr_values = atr(data, ATR_PERIOD)
+    if break_time is not None:
+        after = _positions_after(data, break_time, strict=True)
     else:
-        return {"status": "neutral", "reason": "لا اتجاه واضح"}
+        after = list(range(max(0, len(data) - int(max_candles)), len(data)))
+    if not after:
+        return {"retested": False, "status": "no_candles_after"}
+
+    positions = after[:int(max_candles)]
+    for offset, i in enumerate(positions, start=1):
+        row = data.iloc[i]
+        high, low, close = float(row["high"]), float(row["low"]), float(row["close"])
+        # الإبطال يبدأ من أول شمعة مكتملة بعد الاختراق؛ الذيل وحده لا يبطل.
+        if direction == "up" and close < float(level):
+            return {"retested": False, "status": "invalidated_before_retest",
+                    "violation_idx": i, "violation_time": _time_of(data, i)}
+        if direction == "down" and close > float(level):
+            return {"retested": False, "status": "invalidated_before_retest",
+                    "violation_idx": i, "violation_time": _time_of(data, i)}
+
+        av = atr_val
+        if av is None or not np.isfinite(av) or av <= 0:
+            av = float(atr_values.iloc[i]) if len(atr_values) > i and pd.notna(atr_values.iloc[i]) else np.nan
+        if not np.isfinite(av) or av <= 0:
+            continue
+        tol = compute_tolerance(float(level), float(av))
+        if direction == "up" and float(level) - tol <= low <= float(level) + tol and close > float(level):
+            return {
+                "retested": True, "status": "ok", "type": "up", "level": float(level),
+                "retest_idx": i, "retest_time": _time_of(data, i),
+                "retest_high": high, "retest_low": low,
+                "retest_open": float(row["open"]), "retest_close": close,
+                "atr_at_retest": float(av), "tolerance": round(tol, 6),
+                "candles_since_break": offset,
+            }
+        if direction == "down" and float(level) - tol <= high <= float(level) + tol and close < float(level):
+            return {
+                "retested": True, "status": "ok", "type": "down", "level": float(level),
+                "retest_idx": i, "retest_time": _time_of(data, i),
+                "retest_high": high, "retest_low": low,
+                "retest_open": float(row["open"]), "retest_close": close,
+                "atr_at_retest": float(av), "tolerance": round(tol, 6),
+                "candles_since_break": offset,
+            }
+
+    return {"retested": False, "status": "no_retest_in_window"}
 
 
 # ============================================================
-# FVG — Fair Value Gap
+# 3. فحص الثبات
 # ============================================================
-def detect_fvgs(df, atr_series, min_pct=0.30, min_atr_mult=0.50):
-    """
-    يكتشف كل FVG في الشموع.
-    - FVG صاعدة: low[i] > high[i-2] → المنطقة بين high[i-2] و low[i]
-    - FVG هابطة: high[i] < low[i-2] → المنطقة بين high[i] و low[i-2]
-    يرجع قائمة بكل الفجوات مع حالتها.
-    """
-    fvgs = []
-    n = len(df)
-    for i in range(2, n):
-        c0 = df.iloc[i-2]
-        c2 = df.iloc[i]
-        atr_i = atr_series.iloc[i] if i < len(atr_series) else 0
+def check_stability(df, level, direction, from_idx, until_idx=None):
+    if not _valid_df(df):
+        return {"stable": False, "reason": "no_data"}
+    data = _sorted_df(df)
+    start = int(from_idx)
+    end = len(data) - 1 if until_idx is None else min(int(until_idx), len(data) - 1)
+    if start < 0 or start >= len(data):
+        return {"stable": False, "reason": "invalid_start_index"}
+    if start >= end:
+        return {"stable": True, "reason": "no_candles_after"}
 
-        # فجوة صاعدة
-        if c2["low"] > c0["high"]:
-            top, bot = c2["low"], c0["high"]
-            size = top - bot
-            size_pct = size / c0["high"] * 100 if c0["high"] > 0 else 0
-            if size_pct >= min_pct and size >= min_atr_mult * atr_i:
-                # فحص اللمس
-                touched = False
-                for j in range(i+1, n):
-                    if df.iloc[j]["low"] <= top and df.iloc[j]["high"] >= bot:
-                        touched = True
-                        break
-                fvgs.append({
-                    "type": "bullish",
-                    "top": float(top),
-                    "bottom": float(bot),
-                    "size": float(size),
-                    "size_pct": round(size_pct, 3),
-                    "created_index": i,
-                    "touched": touched,
-                    "virgin": not touched,
-                })
-
-        # فجوة هابطة
-        if c2["high"] < c0["low"]:
-            top, bot = c0["low"], c2["high"]
-            size = top - bot
-            size_pct = size / bot * 100 if bot > 0 else 0
-            if size_pct >= min_pct and size >= min_atr_mult * atr_i:
-                touched = False
-                for j in range(i+1, n):
-                    if df.iloc[j]["low"] <= top and df.iloc[j]["high"] >= bot:
-                        touched = True
-                        break
-                fvgs.append({
-                    "type": "bearish",
-                    "top": float(top),
-                    "bottom": float(bot),
-                    "size": float(size),
-                    "size_pct": round(size_pct, 3),
-                    "created_index": i,
-                    "touched": touched,
-                    "virgin": not touched,
-                })
-
-    return fvgs
+    for i in range(start + 1, end + 1):
+        close = float(data.iloc[i]["close"])
+        if direction == "up" and close < level:
+            return {"stable": False, "reason": f"close_below_at_{i}", "violation_idx": i}
+        if direction == "down" and close > level:
+            return {"stable": False, "reason": f"close_above_at_{i}", "violation_idx": i}
+    return {"stable": True, "reason": "no_violation"}
 
 
 # ============================================================
-# Liquidity Sweep
+# 4. المسار الأول: الشمعة الأولى والثانية
 # ============================================================
-def detect_sweep(df, level, direction, min_pct=0.15):
-    """
-    direction = "low": سحب سيولة من قاع (bullish)
-        - الشمعة الحالية (الأخيرة): low < level (تجاوز ≥ 0.15%) + close > level
-    direction = "high": سحب سيولة من قمة (bearish)
-        - الشمعة الحالية: high > level (تجاوز ≥ 0.15%) + close < level
-    """
-    if len(df) < 2:
+def find_second_candle(df, level, direction, retest_idx,
+                       max_window=MAX_SECOND_CANDLE_WINDOW,
+                       max_first_window=MAX_FIRST_CANDLE_WINDOW):
+    """لا تحتسب شمعة Retest؛ أول تأكيد قوي ثم الشمعة المكتملة التالية مباشرة."""
+    data = _sorted_df(df) if _valid_df(df) else pd.DataFrame()
+    if data.empty or retest_idx < 0 or retest_idx >= len(data):
+        return {"found": False, "reason": "invalid_retest_index"}
+
+    retest_idx = int(retest_idx)
+    first_end = min(len(data) - 1, retest_idx + int(max_first_window))
+    first_idx = None
+    for i in range(retest_idx + 1, first_end + 1):
+        row = data.iloc[i]
+        close = float(row["close"])
+        if direction == "up" and close < level:
+            return {"found": False, "reason": "invalidated_before_first", "violation_idx": i}
+        if direction == "down" and close > level:
+            return {"found": False, "reason": "invalidated_before_first", "violation_idx": i}
+        directional = (_is_bullish(row) and close > level) if direction == "up" else (_is_bearish(row) and close < level)
+        if directional and _body_ratio(row) >= BODY_RATIO_MIN:
+            first_idx = i
+            break
+    if first_idx is None:
+        return {"found": False, "reason": "no_first_in_window"}
+
+    second_idx = first_idx + 1
+    if second_idx >= len(data) or second_idx > first_idx + int(max_window):
+        return {"found": False, "reason": "no_second_in_window"}
+    row = data.iloc[second_idx]
+    close = float(row["close"])
+    if direction == "up" and close < level:
+        return {"found": False, "reason": "invalidated_before_second", "violation_idx": second_idx}
+    if direction == "down" and close > level:
+        return {"found": False, "reason": "invalidated_before_second", "violation_idx": second_idx}
+    directional = (_is_bullish(row) and close > level) if direction == "up" else (_is_bearish(row) and close < level)
+    if not directional or _body_ratio(row) < BODY_RATIO_MIN:
+        return {"found": False, "reason": "second_candle_not_confirmed", "second_idx": second_idx}
+
+    return {"found": True, "first_idx": first_idx, "second_idx": second_idx,
+            "entry": close, "entry_time": _time_of(data, second_idx),
+            "body_ratio": round(_body_ratio(row), 2),
+            "candles_after_first": 1}
+
+
+# ============================================================
+# 5. المسار الثاني: تأكيد 1H
+# ============================================================
+def find_confirmation_1h(df_1h, retest_info, direction):
+    if not _valid_df(df_1h) or not retest_info:
+        return {"confirmed": False, "reason": "no_data"}
+    data = _sorted_df(df_1h)
+    retest_high = retest_info.get("retest_high")
+    retest_low = retest_info.get("retest_low")
+    retest_time = retest_info.get("retest_time")
+    if retest_time is None:
+        return {"confirmed": False, "reason": "missing_retest_time"}
+
+    candidates = _positions_after(data, retest_time, strict=True)[:MAX_1H_CONFIRM_CANDLES]
+    if not candidates:
+        return {"confirmed": False, "reason": "no_1h_after_retest"}
+    for i in candidates:
+        row = data.iloc[i]
+        close = float(row["close"])
+        body = _body_ratio(row)
+        if direction == "up" and retest_high is not None:
+            if close > float(retest_high) and _is_bullish(row) and body >= BODY_RATIO_MIN:
+                return {"confirmed": True, "confirm_idx": i, "entry": close,
+                        "confirm_time": _time_of(data, i), "body_ratio": round(body, 2)}
+        if direction == "down" and retest_low is not None:
+            if close < float(retest_low) and _is_bearish(row) and body >= BODY_RATIO_MIN:
+                return {"confirmed": True, "confirm_idx": i, "entry": close,
+                        "confirm_time": _time_of(data, i), "body_ratio": round(body, 2)}
+    return {"confirmed": False, "reason": "no_confirmation"}
+
+
+# ============================================================
+# 6. كشف نمط الشمعة (وصفي فقط)
+# ============================================================
+def detect_pattern(df, idx, direction):
+    if not _valid_df(df) or idx < 1 or idx >= len(df):
+        return "none"
+    data = _sorted_df(df)
+    cur, prev = data.iloc[idx], data.iloc[idx - 1]
+    cur_o, cur_c = float(cur["open"]), float(cur["close"])
+    cur_h, cur_l = float(cur["high"]), float(cur["low"])
+    prev_o, prev_c = float(prev["open"]), float(prev["close"])
+    br = _body_ratio(cur)
+
+    if direction == "up":
+        if _is_bearish(prev) and _is_bullish(cur) and cur_o <= prev_c and cur_c >= prev_o:
+            return "engulfing"
+        rng = cur_h - cur_l
+        if rng > 0 and (min(cur_o, cur_c) - cur_l) >= 2 * br * rng and br < 0.4:
+            return "hammer"
+    else:
+        if _is_bullish(prev) and _is_bearish(cur) and cur_o >= prev_c and cur_c <= prev_o:
+            return "engulfing"
+        rng = cur_h - cur_l
+        if rng > 0 and (cur_h - max(cur_o, cur_c)) >= 2 * br * rng and br < 0.4:
+            return "shooting_star"
+    return "none"
+
+
+# ============================================================
+# 7. بناء النتيجة
+# ============================================================
+def _build_result(direction, stage, entry, target1, target2, stop,
+                  level, retest_info, break_info, sr_dict, tfs, pattern=""):
+    if any(v is None or not np.isfinite(float(v)) for v in (entry, target1, stop)):
+        return None
+    entry, target1, stop = float(entry), float(target1), float(stop)
+    # الوقف يجب أن يكون في الجهة الصحيحة من الدخول، لا نستخدم abs لإخفاء وقف غير صالح.
+    if direction == "up" and stop >= entry:
+        return None
+    if direction == "down" and stop <= entry:
+        return None
+    risk = (entry - stop) if direction == "up" else (stop - entry)
+    reward = (target1 - entry) if direction == "up" else (entry - target1)
+    if risk <= 0 or reward <= 0:
+        return None
+    rr = round(reward / risk, 2)
+    if rr < MIN_RR:
         return None
 
-    r = df.iloc[-1]  # الشمعة الأخيرة المكتملة
+    levels = {
+        "entry": round(entry, 2), "stop": round(stop, 2),
+        "target1": round(target1, 2), "rr": rr,
+        "level_broken": round(float(level), 2), "pattern": pattern,
+    }
+    if target2 is not None and np.isfinite(float(target2)):
+        target2 = float(target2)
+        target2_is_ahead = target2 > entry if direction == "up" else target2 < entry
+        target2_is_beyond_target1 = target2 > target1 if direction == "up" else target2 < target1
+        if target2_is_ahead and target2_is_beyond_target1:
+            levels["target2"] = round(target2, 2)
 
-    if direction == "low":
-        if r["low"] < level and r["close"] > level:
-            pct = (level - r["low"]) / level * 100
-            if pct >= min_pct:
-                return {
-                    "type": "bullish",
-                    "index": len(df) - 1,
-                    "sweep": float(r["low"]),
-                    "level": float(level),
-                    "percent": round(pct, 3),
-                }
-
-    if direction == "high":
-        if r["high"] > level and r["close"] < level:
-            pct = (r["high"] - level) / level * 100
-            if pct >= min_pct:
-                return {
-                    "type": "bearish",
-                    "index": len(df) - 1,
-                    "sweep": float(r["high"]),
-                    "level": float(level),
-                    "percent": round(pct, 3),
-                }
-
-    return None
-
-
-# ============================================================
-# تسلسل الدخول على 1H
-# ============================================================
-def check_entry_sequence(df_1h, atr_1h):
-    """
-    يبحث عن تسلسل الدخول الكامل على 1H:
-    Sweep ← Virgin FVG ← عودة ← تأكيد إغلاق
-    
-    يرجع dict: {found, direction, sweep, fvg, entry, stop, target, rr, confirm_index}
-    """
-    if len(df_1h) < 30:
-        return {"found": False}
-
-    fvgs = detect_fvgs(df_1h, atr_1h)
-    sh_idx = swing_highs(df_1h, 2)
-    sl_idx = swing_lows(df_1h, 2)
-
-    # البحث من الأحدث للأقدم
-    for direction in ["bullish", "bearish"]:
-        if direction == "bullish":
-            # ابحث عن Sweep من قاع
-            if not sl_idx:
-                continue
-            # آخر 3 قيعان محورية
-            for sl in reversed(sl_idx[-3:]):
-                if sl >= len(df_1h) - 5:  # القاع قريب جداً من النهاية
-                    continue
-                level = float(df_1h["low"].iloc[sl])
-                # افحص الشموع بعد هذا القاع بحثاً عن sweep
-                for k in range(sl + 1, len(df_1h)):
-                    sweep = detect_sweep(df_1h.iloc[:k+1], level, "low")
-                    if not sweep:
-                        continue
-                    # وجدنا Sweep — ابحث عن Virgin FVG صاعدة خلال 3 شموع
-                    sweep_idx = k
-                    for fvg in reversed(fvgs):
-                        if fvg["type"] != "bullish":
-                            continue
-                        ci = fvg["created_index"]
-                        if ci < sweep_idx or ci > sweep_idx + 3:
-                            continue
-                        # تأكد من أنها virgin (لم تُلمس قبل الـ Sweep)
-                        touched_before = False
-                        for j in range(ci + 1, sweep_idx):
-                            if df_1h.iloc[j]["low"] <= fvg["top"] and \
-                               df_1h.iloc[j]["high"] >= fvg["bottom"]:
-                                touched_before = True
-                                break
-                        if touched_before:
-                            continue
-
-                        # افحص العودة والتأكيد بعد الـ FVG
-                        for j in range(ci + 1, len(df_1h)):
-                            rj = df_1h.iloc[j]
-                            # العودة: السعر لمس الفجوة
-                            if rj["low"] <= fvg["top"] and rj["high"] >= fvg["bottom"]:
-                                # التأكيد: إغلاق فوق الحد الأعلى للفجوة
-                                if rj["close"] > fvg["top"]:
-                                    entry = float(rj["close"])
-                                    stop = float(sweep["sweep"]) - 0.10 * float(atr_1h.iloc[-1])
-                                    risk = entry - stop
-                                    if risk <= 0:
-                                        continue
-                                    # الهدف: أقرب Swing High فوق entry
-                                    target = None
-                                    for sh in reversed(sh_idx):
-                                        h = float(df_1h["high"].iloc[sh])
-                                        if h > entry + 0.01:
-                                            target = h
-                                            break
-                                    if target is None:
-                                        # احتياط: أعلى 50 شمعة
-                                        target = float(df_1h["high"].iloc[-50:].max())
-                                    reward = target - entry
-                                    rr = reward / risk if risk > 0 else 0
-
-                                    return {
-                                        "found": True,
-                                        "direction": "bullish",
-                                        "sweep": sweep,
-                                        "fvg": fvg,
-                                        "entry": round(entry, 2),
-                                        "stop": round(stop, 2),
-                                        "target": round(target, 2),
-                                        "rr": round(rr, 2),
-                                        "confirm_index": j,
-                                    }
-                                else:
-                                    # اللمس بدون تأكيد → أوقف هذا المسار
-                                    break
-
-        else:  # bearish
-            if not sh_idx:
-                continue
-            for sh in reversed(sh_idx[-3:]):
-                if sh >= len(df_1h) - 5:
-                    continue
-                level = float(df_1h["high"].iloc[sh])
-                for k in range(sh + 1, len(df_1h)):
-                    sweep = detect_sweep(df_1h.iloc[:k+1], level, "high")
-                    if not sweep:
-                        continue
-                    sweep_idx = k
-                    for fvg in reversed(fvgs):
-                        if fvg["type"] != "bearish":
-                            continue
-                        ci = fvg["created_index"]
-                        if ci < sweep_idx or ci > sweep_idx + 3:
-                            continue
-                        touched_before = False
-                        for j in range(ci + 1, sweep_idx):
-                            if df_1h.iloc[j]["low"] <= fvg["top"] and \
-                               df_1h.iloc[j]["high"] >= fvg["bottom"]:
-                                touched_before = True
-                                break
-                        if touched_before:
-                            continue
-
-                        for j in range(ci + 1, len(df_1h)):
-                            rj = df_1h.iloc[j]
-                            if rj["low"] <= fvg["top"] and rj["high"] >= fvg["bottom"]:
-                                if rj["close"] < fvg["bottom"]:
-                                    entry = float(rj["close"])
-                                    stop = float(sweep["sweep"]) + 0.10 * float(atr_1h.iloc[-1])
-                                    risk = stop - entry
-                                    if risk <= 0:
-                                        continue
-                                    target = None
-                                    for sl in reversed(sl_idx):
-                                        lo = float(df_1h["low"].iloc[sl])
-                                        if lo < entry - 0.01:
-                                            target = lo
-                                            break
-                                    if target is None:
-                                        target = float(df_1h["low"].iloc[-50:].min())
-                                    reward = entry - target
-                                    rr = reward / risk if risk > 0 else 0
-
-                                    return {
-                                        "found": True,
-                                        "direction": "bearish",
-                                        "sweep": sweep,
-                                        "fvg": fvg,
-                                        "entry": round(entry, 2),
-                                        "stop": round(stop, 2),
-                                        "target": round(target, 2),
-                                        "rr": round(rr, 2),
-                                        "confirm_index": j,
-                                    }
-                                else:
-                                    break
-
-    return {"found": False}
-
-
-# ============================================================
-# نظام النقاط (100 نقطة)
-# ============================================================
-def calculate_score(trend_w, trend_d, trend_4h, sweep, fvg, confirmed, rvol_val):
-    """
-    التوزيع:
-    1W = 25 | 1D = 20 | 4H = 20
-    Sweep = 8 | FVG = 7 | Retest+Confirm = 10
-    RVOL = 10
-    """
-    score = 0
-
-    # 1W
-    if trend_w == "up" or trend_w == "down":
-        score += 25
-
-    # 1D
-    if trend_d == "up" or trend_d == "down":
-        score += 20
-
-    # 4H
-    if trend_4h == "up" or trend_4h == "down":
-        score += 20
-
-    # Sweep
-    if sweep:
-        score += 8
-
-    # FVG
-    if fvg:
-        score += 7
-
-    # Retest + Confirm
-    if confirmed:
-        score += 10
-
-    # RVOL (متدرج)
-    if rvol_val >= 2.0:
-        score += 10
-    elif rvol_val >= 1.5:
-        score += 7
-    elif rvol_val >= 1.0:
-        score += 3
-    else:
-        score += 0
-
-    return score
-
-
-# ============================================================
-# تصنيف البطاقة
-# ============================================================
-def classify_setup(setup):
-    """
-    CONFIRMED: تسلسل كامل + RR ≥ 2 + Score ≥ 70
-    WAIT:      اتجاه موجود لكن لا تسلسل كامل
-    GRAY:      لا اتجاه
-    """
-    if not setup.get("sequence_found"):
-        if setup["trend_w"] in ("up", "down"):
-            return {"status": "wait", "color": "yellow", "label": "انتظار"}
-        return {"status": "gray", "color": "gray", "label": "لم تجتز"}
-
-    # التسلسل موجود — افحص الشروط
-    if setup["rr"] < 2.0:
-        return {"status": "wait", "color": "yellow", "label": "انتظار (RR)"}
-    if setup["score"] < 70:
-        return {"status": "wait", "color": "yellow", "label": "انتظار"}
-
-    if setup["direction"] == "bullish":
-        return {"status": "call", "color": "green", "label": "تأكيد CALL"}
-    else:
-        return {"status": "put", "color": "red", "label": "تأكيد PUT"}
-
-
-# ============================================================
-# المستويات
-# ============================================================
-def compute_levels(entry, stop, target):
-    """يرجع dict بالمستويات"""
-    risk = abs(entry - stop)
-    reward = abs(target - entry)
-    rr = reward / risk if risk > 0 else 0
     return {
-        "entry": round(entry, 2),
-        "stop": round(stop, 2),
-        "target1": round(target, 2),
-        "target2": round(target, 2),   # للمستقبل
-        "rr": round(rr, 2),
+        "color": "green" if direction == "up" else "red",
+        "label": "تأكيد CALL" if direction == "up" else "تأكيد PUT",
+        "status": "confirmed", "direction": "call" if direction == "up" else "put",
+        "breakout_stage": stage, "levels": levels, "break_info": break_info,
+        "retest_info": retest_info, "support_resistance": sr_dict, "timeframes": tfs,
+    }
+
+
+def _tf_snapshot(df, label):
+    """لقطة فريم للعرض: high/low شمعة سابقة + سعر الإغلاق الأخير."""
+    if not _valid_df(df) or len(df) < 5:
+        return {"label": label, "support": None, "resistance": None,
+                "broke_resistance": False, "broke_support": False}
+    data = _sorted_df(df)
+    res, sup = prev_candle_hl(data, -2)
+    price = float(data.iloc[-1]["close"])
+    return {
+        "label": label,
+        "support": round(sup, 2) if sup is not None else None,
+        "resistance": round(res, 2) if res is not None else None,
+        "broke_resistance": res is not None and price > res,
+        "broke_support": sup is not None and price < sup,
+    }
+
+
+def _empty_result(sr_dict=None, tfs=None):
+    return {
+        "color": "gray", "label": "لا إشارة", "status": "none",
+        "direction": None, "breakout_stage": None, "levels": {},
+        "timeframes": tfs or [], "support_resistance": sr_dict or {},
     }
 
 
 # ============================================================
-# الدالة الرئيسية — تُستدعى من main.py
+# 8. الدالة الرئيسية
 # ============================================================
 def scan_setup(df_weekly, df_daily, df_4h, df_1h):
-    """
-    يرجع dict كامل يحتوي على:
-    - trend_w / trend_d / trend_4h
-    - sweep / fvg / rr / score
-    - color / label / status
-    - direction / entry / stop / target
-    - rvol
-    """
-    atr_1h = atr(df_1h, 14)
+    frames = [df_weekly, df_daily, df_4h, df_1h]
+    if any(not _valid_df(d) or len(d) < 25 for d in frames):
+        return _empty_result()
 
-    # 1) الاتجاهات
-    tw = trend_status(df_weekly, use_ema200=False)
-    td = trend_status(df_daily, use_ema200=True)
-    t4 = trend_status(df_4h, use_ema200=False)
+    df_weekly, df_daily, df_4h, df_1h = [_sorted_df(d) for d in frames]
 
-    # 2) التسلسل على 1H
-    seq = check_entry_sequence(df_1h, atr_1h)
+    now_ny = _now_market()
+    display_w_high, display_w_low = get_prev_week_levels(df_weekly, now_ny)
+    display_d_high, display_d_low = get_prev_day_levels(df_daily, now_ny)
 
-    # 3) RVOL
-    rv = rvol(df_1h, 20)
-
-    # 4) الاتجاه العام
-    direction = None
-    if seq["found"]:
-        direction = seq["direction"]
-
-    # 5) التسجيل
-    score = calculate_score(
-        trend_w=tw["status"],
-        trend_d=td["status"],
-        trend_4h=t4["status"],
-        sweep=seq.get("sweep"),
-        fvg=seq.get("fvg"),
-        confirmed=seq.get("confirm_index") is not None,
-        rvol_val=rv,
-    )
-
-    # 6) تحديد اللون والحالة
-    setup_for_classify = {
-        "sequence_found": seq["found"],
-        "trend_w": tw["status"],
-        "direction": direction,
-        "score": score,
-        "rr": seq.get("rr", 0),
+    sr_dict = {
+        "weekly": {"support": round(display_w_low, 2) if display_w_low is not None else None,
+                   "resistance": round(display_w_high, 2) if display_w_high is not None else None},
+        "daily": {"support": round(display_d_low, 2) if display_d_low is not None else None,
+                  "resistance": round(display_d_high, 2) if display_d_high is not None else None},
     }
-    card = classify_setup(setup_for_classify)
+    tfs = [_tf_snapshot(df_weekly, "1W"), _tf_snapshot(df_daily, "1D"),
+           _tf_snapshot(df_4h, "4H"), _tf_snapshot(df_1h, "1H")]
 
-    # 7) المستويات
-    levels = {}
-    if seq["found"]:
-        levels = compute_levels(seq["entry"], seq["stop"], seq["target"])
-    else:
-        levels = {"entry": None, "stop": None, "target1": None, "target2": None, "rr": 0}
+    atr4s, atr1s = atr(df_4h), atr(df_1h)
+    if len(atr4s) == 0 or len(atr1s) == 0:
+        return _empty_result(sr_dict, tfs)
 
-    return {
-        "trend_w": tw,
-        "trend_d": td,
-        "trend_4h": t4,
-        "sequence": seq,
-        "sweep": seq.get("sweep"),
-        "fvg": seq.get("fvg"),
-        "rvol": round(rv, 2),
-        "score": score,
-        "color": card["color"],
-        "label": card["label"],
-        "status": card["status"],
-        "direction": direction,
-        "levels": levels,
-        "atr_1h": round(float(atr_1h.iloc[-1]), 2),
-    }
+    # ── المسار الأول
+    for direction in ("up", "down"):
+        brk = check_breakout_dynamic(df_daily, df_weekly, direction)
+        if not brk.get("broken"):
+            continue
+        level = float(brk["level"])
+        retest = find_retest(df_4h, level, direction, brk["break_time"])
+        if not retest.get("retested"):
+            continue
+        second = find_second_candle(df_4h, level, direction, retest["retest_idx"])
+        if not second.get("found"):
+            continue
+        if int(second["second_idx"]) != len(df_4h) - 1:
+            continue
+        atr_4h = float(atr4s.iloc[int(second["second_idx"])]) if pd.notna(atr4s.iloc[int(second["second_idx"])]) else np.nan
+        if not np.isfinite(atr_4h) or atr_4h <= 0:
+            continue
+        stab = check_stability(df_4h, level, direction,
+                                retest["retest_idx"], second["second_idx"])
+        if not stab["stable"]:
+            continue
+
+        entry = second["entry"]
+        entry_time = pd.to_datetime(second["entry_time"], utc=True)
+        daily_break_row = df_daily.iloc[int(brk["break_index"])]
+        target1 = float(daily_break_row["high"] if direction == "up" else daily_break_row["low"])
+        start_time = pd.to_datetime(brk["break_time"], utc=True)
+        prior_rows = df_4h[(df_4h["close_time"] < entry_time) &
+                           (df_4h["close_time"] >= start_time)]
+        if not prior_rows.empty:
+            continuation = float(prior_rows["high"].max() if direction == "up" else prior_rows["low"].min())
+            target1 = max(target1, continuation) if direction == "up" else min(target1, continuation)
+        if target1 is None:
+            continue
+        stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_4h
+                if direction == "up"
+                else retest["retest_high"] + ATR_MULTIPLIER * atr_4h)
+        result = _build_result(
+            direction, "daily_break_weekly", entry, target1, None,
+            stop, level, retest, brk, sr_dict, tfs,
+            detect_pattern(df_4h, second["second_idx"], direction),
+        )
+        if result:
+            return result
+
+    # ── المسار الثاني
+    last_daily_row = df_daily.iloc[-1]
+    prior_week_high, prior_week_low = _reference_levels_before(
+        df_weekly, last_daily_row["close_time"])
+    path2_directions = []
+    if prior_week_high is not None and float(last_daily_row["close"]) <= prior_week_high:
+        path2_directions.append("up")
+    if prior_week_low is not None and float(last_daily_row["close"]) >= prior_week_low:
+        path2_directions.append("down")
+    for direction in path2_directions:
+        brk = check_breakout_dynamic(df_4h, df_daily, direction)
+        if not brk.get("broken"):
+            continue
+        level = float(brk["level"])
+        retest = find_retest(df_4h, level, direction, brk["break_time"])
+        if not retest.get("retested"):
+            continue
+        confirm = find_confirmation_1h(df_1h, retest, direction)
+        if not confirm.get("confirmed"):
+            continue
+        if int(confirm["confirm_idx"]) != len(df_1h) - 1:
+            continue
+        atr_1h = float(atr1s.iloc[int(confirm["confirm_idx"])]) if pd.notna(atr1s.iloc[int(confirm["confirm_idx"])]) else np.nan
+        if not np.isfinite(atr_1h) or atr_1h <= 0:
+            continue
+
+        confirm_time = confirm.get("confirm_time")
+        if confirm_time is None:
+            continue
+        eligible = np.flatnonzero(
+            (df_4h["close_time"] <= pd.to_datetime(confirm_time, utc=True)).to_numpy()
+        )
+        stability_end = int(eligible[-1]) if len(eligible) else int(retest["retest_idx"])
+        stab = check_stability(df_4h, level, direction,
+                                retest["retest_idx"], stability_end)
+        if not stab["stable"]:
+            continue
+
+        entry = confirm["entry"]
+        confirm_ts = pd.to_datetime(confirm_time, utc=True)
+        start_ts = pd.to_datetime(brk["break_time"], utc=True)
+        prior_rows = df_4h[(df_4h["close_time"] < confirm_ts) &
+                           (df_4h["close_time"] >= start_ts)]
+        if prior_rows.empty:
+            continue
+        target1 = (float(prior_rows["high"].max()) if direction == "up"
+                   else float(prior_rows["low"].min()))
+        target2_high, target2_low = _reference_levels_before(df_weekly, brk["break_time"])
+        target2 = target2_high if direction == "up" else target2_low
+        stop = (retest["retest_low"] - ATR_MULTIPLIER * atr_1h
+                if direction == "up"
+                else retest["retest_high"] + ATR_MULTIPLIER * atr_1h)
+        result = _build_result(
+            direction, "4h_break_daily", entry, target1, target2,
+            stop, level, retest, brk, sr_dict, tfs,
+            detect_pattern(df_1h, confirm["confirm_idx"], direction),
+        )
+        if result:
+            return result
+
+    return _empty_result(sr_dict, tfs)
+
+
+# ============================================================
+# 9. تصدير
+# ============================================================
+def last_price(df):
+    if not _valid_df(df):
+        return None
+    data = _sorted_df(df)
+    return float(data.iloc[-1]["close"]) if not data.empty else None
