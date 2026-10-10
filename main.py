@@ -46,7 +46,6 @@ _ai_cache: dict[str, tuple[float, str]] = {}
 _AI_CACHE_TTL = 1800
 _ANALYZE_TTL = 25
 
-# ✅ فلاتر التاريخ فقط (لا فلتر سعر أو سبريد)
 DTE_MIN = 5
 DTE_MAX = 20
 DTE_TARGET = 10
@@ -264,7 +263,7 @@ def fetch_option_data(symbol, direction, price, strategy="swing"):
     يختار أقرب Strike:
       - bullish: من أقرب 5 CALL فوق السعر
       - bearish: من أقرب 5 PUT تحت السعر
-      - الأقرب إلى 2% OTM هو المختار
+      - الأقرب إلى 2% OTM
       - بدون فلتر سعر/سبريد
     """
     ctx = get_ctx()
@@ -479,6 +478,7 @@ def analyze_symbol(symbol):
         "card": card,
         "levels": levels,
         "timeframes": tfs,
+        "strategy_boxes": scan.get("strategy_boxes", []),
         "support_resistance": sr,
         "break_info": scan.get("break_info", {}),
         "call_oi": opt.get("call_oi", []),
